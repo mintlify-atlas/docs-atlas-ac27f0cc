@@ -1,0 +1,199 @@
+{
+  "projectType": "data-platform",
+  "projectName": "PostgreSQL",
+  "projectDescription": "PostgreSQL is an advanced open-source object-relational database management system that supports an extended subset of the SQL standard, including transactions, foreign keys, subqueries, triggers, user-defined types, and functions.",
+  "theme": "sequoia",
+  "primaryColor": "#355a7d",
+  "lightColor": "#94b5c4",
+  "darkColor": "#dae1e4",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Getting Started",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/data-model",
+              "concepts/transactions",
+              "concepts/mvcc"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SQL Reference",
+        "groups": [
+          {
+            "group": "Data Definition",
+            "pages": [
+              "sql/ddl-overview",
+              "sql/data-types",
+              "sql/constraints",
+              "sql/indexes"
+            ]
+          },
+          {
+            "group": "Querying Data",
+            "pages": [
+              "sql/queries",
+              "sql/joins",
+              "sql/aggregates",
+              "sql/window-functions",
+              "sql/json"
+            ]
+          },
+          {
+            "group": "Advanced SQL",
+            "pages": [
+              "sql/full-text-search",
+              "sql/partitioning",
+              "sql/rules-triggers",
+              "sql/arrays",
+              "sql/range-types"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Administration",
+        "groups": [
+          {
+            "group": "Server Management",
+            "pages": [
+              "admin/server-setup",
+              "admin/configuration",
+              "admin/client-auth",
+              "admin/user-management"
+            ]
+          },
+          {
+            "group": "Backup & Recovery",
+            "pages": [
+              "admin/backup",
+              "admin/point-in-time-recovery",
+              "admin/high-availability"
+            ]
+          },
+          {
+            "group": "Replication",
+            "pages": [
+              "admin/streaming-replication",
+              "admin/logical-replication"
+            ]
+          },
+          {
+            "group": "Monitoring & Maintenance",
+            "pages": [
+              "admin/monitoring",
+              "admin/routine-maintenance",
+              "admin/performance-tuning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Developer Guide",
+        "groups": [
+          {
+            "group": "Client Interfaces",
+            "pages": [
+              "dev/libpq",
+              "dev/ecpg"
+            ]
+          },
+          {
+            "group": "Procedural Languages",
+            "pages": [
+              "dev/plpgsql",
+              "dev/plpython",
+              "dev/plperl",
+              "dev/pltcl"
+            ]
+          },
+          {
+            "group": "Extending PostgreSQL",
+            "pages": [
+              "dev/extending-overview",
+              "dev/custom-functions",
+              "dev/custom-types",
+              "dev/custom-operators",
+              "dev/custom-indexes",
+              "dev/fdw"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Tools & Extensions",
+        "groups": [
+          {
+            "group": "Command-Line Tools",
+            "pages": [
+              "tools/psql",
+              "tools/pg-dump",
+              "tools/pg-ctl",
+              "tools/pg-upgrade",
+              "tools/pgbench"
+            ]
+          },
+          {
+            "group": "Notable Extensions",
+            "pages": [
+              "extensions/pg-stat-statements",
+              "extensions/pg-trgm",
+              "extensions/hstore",
+              "extensions/postgis-intro",
+              "extensions/pgcrypto"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "ACID-compliant transactions with MVCC (Multi-Version Concurrency Control)",
+    "Advanced SQL support including window functions, CTEs, and lateral joins",
+    "Powerful full-text search with configurable text search dictionaries",
+    "Flexible JSON/JSONB support for document storage alongside relational data",
+    "Streaming and logical replication for high availability and data distribution",
+    "Extensible type system with user-defined types, functions, operators, and index methods",
+    "Robust partitioning with declarative range, list, and hash partitioning",
+    "Foreign Data Wrappers (FDW) for querying external data sources",
+    "Multiple procedural languages: PL/pgSQL, PL/Python, PL/Perl, PL/Tcl",
+    "Point-in-Time Recovery (PITR) and comprehensive backup tooling",
+    "Row-level security (RLS) and fine-grained access control",
+    "JIT compilation for complex analytical queries"
+  ],
+  "publicApiSurface": [
+    "libpq C client library API",
+    "SQL: SELECT, INSERT, UPDATE, DELETE, MERGE",
+    "SQL DDL: CREATE/ALTER/DROP TABLE, INDEX, SEQUENCE, VIEW, MATERIALIZED VIEW",
+    "SQL: CREATE FUNCTION / PROCEDURE (PL/pgSQL, PL/Python, PL/Perl, PL/Tcl, C)",
+    "SQL: CREATE EXTENSION",
+    "SQL: CREATE FOREIGN DATA WRAPPER / SERVER / USER MAPPING",
+    "System catalogs: pg_class, pg_attribute, pg_proc, pg_index, etc.",
+    "Information schema views",
+    "psql CLI client",
+    "pg_dump / pg_restore backup utilities",
+    "pg_ctl server control utility",
+    "pg_basebackup physical backup tool",
+    "pg_upgrade major version upgrade tool",
+    "initdb cluster initialization utility",
+    "pgbench benchmarking tool",
+    "pg_stat_statements extension",
+    "SPI (Server Programming Interface) for C extensions",
+    "Generic WAL API for custom resource managers",
+    "Table Access Method API",
+    "Index Access Method API"
+  ]
+}
