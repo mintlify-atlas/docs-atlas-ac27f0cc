@@ -1,122 +1,180 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "PostgreSQL",
+  "theme": "sequoia",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#355a7d",
+    "light": "#94b5c4",
+    "dark": "#dae1e4"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/34c6c6f6-24e0-475a-9615-39611981e0f5.jpg",
+  "logo": {
+    "light": "https://media.brand.dev/bbce1c6d-f0d7-45ea-8578-4e29b2e68eb1.jpg",
+    "dark": "https://media.brand.dev/bbce1c6d-f0d7-45ea-8578-4e29b2e68eb1.jpg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/postgres/postgres"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/postgres/postgres"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Getting Started",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Introduction",
             "pages": [
-              "index",
+              "introduction",
               "quickstart",
-              "development"
+              "installation"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
-            ]
-          },
-          {
-            "group": "Writing content",
-            "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
-            ]
-          },
-          {
-            "group": "AI tools",
-            "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "concepts/architecture",
+              "concepts/data-model",
+              "concepts/transactions",
+              "concepts/mvcc"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "SQL Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Data Definition",
             "pages": [
-              "api-reference/introduction"
+              "sql/ddl-overview",
+              "sql/data-types",
+              "sql/constraints",
+              "sql/indexes"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Querying Data",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "sql/queries",
+              "sql/joins",
+              "sql/aggregates",
+              "sql/window-functions",
+              "sql/json"
+            ]
+          },
+          {
+            "group": "Advanced SQL",
+            "pages": [
+              "sql/full-text-search",
+              "sql/partitioning",
+              "sql/rules-triggers",
+              "sql/arrays",
+              "sql/range-types"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Administration",
+        "groups": [
+          {
+            "group": "Server Management",
+            "pages": [
+              "admin/server-setup",
+              "admin/configuration",
+              "admin/client-auth",
+              "admin/user-management"
+            ]
+          },
+          {
+            "group": "Backup & Recovery",
+            "pages": [
+              "admin/backup",
+              "admin/point-in-time-recovery",
+              "admin/high-availability"
+            ]
+          },
+          {
+            "group": "Replication",
+            "pages": [
+              "admin/streaming-replication",
+              "admin/logical-replication"
+            ]
+          },
+          {
+            "group": "Monitoring & Maintenance",
+            "pages": [
+              "admin/monitoring",
+              "admin/routine-maintenance",
+              "admin/performance-tuning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Developer Guide",
+        "groups": [
+          {
+            "group": "Client Interfaces",
+            "pages": [
+              "dev/libpq",
+              "dev/ecpg"
+            ]
+          },
+          {
+            "group": "Procedural Languages",
+            "pages": [
+              "dev/plpgsql",
+              "dev/plpython",
+              "dev/plperl",
+              "dev/pltcl"
+            ]
+          },
+          {
+            "group": "Extending PostgreSQL",
+            "pages": [
+              "dev/extending-overview",
+              "dev/custom-functions",
+              "dev/custom-types",
+              "dev/custom-operators",
+              "dev/custom-indexes",
+              "dev/fdw"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Tools & Extensions",
+        "groups": [
+          {
+            "group": "Command-Line Tools",
+            "pages": [
+              "tools/psql",
+              "tools/pg-dump",
+              "tools/pg-ctl",
+              "tools/pg-upgrade",
+              "tools/pgbench"
+            ]
+          },
+          {
+            "group": "Notable Extensions",
+            "pages": [
+              "extensions/pg-stat-statements",
+              "extensions/pg-trgm",
+              "extensions/hstore",
+              "extensions/postgis-intro",
+              "extensions/pgcrypto"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

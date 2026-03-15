@@ -1,0 +1,221 @@
+---
+title: pg_upgrade
+description: Upgrade a PostgreSQL cluster to a new major version without a full dump and reload.
+---
+
+`pg_upgrade` upgrades a PostgreSQL cluster from one major version to a later major version. It transfers data files in place rather than dumping and reloading, which is significantly faster than a logical backup approach for large databases.
+
+<Note>
+Both the old and new PostgreSQL installations must be present on the same machine (or their binary directories must be accessible). The old cluster must be shut down before running `pg_upgrade`.
+</Note>
+
+## Required information
+
+You must provide:
+
+- `-d` / `--old-datadir` — data directory of the old cluster
+- `-D` / `--new-datadir` — data directory of the new cluster  
+- `-b` / `--old-bindir` — binary directory of the old PostgreSQL installation
+- `-B` / `--new-bindir` — binary directory of the new PostgreSQL installation (defaults to the same directory as `pg_upgrade` itself)
+
+## All options
+
+| Flag | Description |
+|------|-------------|
+| `-b BINDIR` / `--old-bindir` | Old cluster executable directory |
+| `-B BINDIR` / `--new-bindir` | New cluster executable directory |
+| `-c` / `--check` | Check clusters only, do not change any data |
+| `-d DATADIR` / `--old-datadir` | Old cluster data directory |
+| `-D DATADIR` / `--new-datadir` | New cluster data directory |
+| `-j NUM` / `--jobs` | Number of simultaneous processes to use |
+| `-k` / `--link` | Use hard links instead of copying files |
+| `-N` / `--no-sync` | Do not wait for changes to be safely written to disk |
+| `-o OPTIONS` / `--old-options` | Options to pass to old server |
+| `-O OPTIONS` / `--new-options` | Options to pass to new server |
+| `-p PORT` / `--old-port` | Old cluster port |
+| `-P PORT` / `--new-port` | New cluster port |
+| `-r` / `--retain` | Retain SQL and log files after success |
+| `-s DIR` / `--socketdir` | Socket directory to use (default: current directory) |
+| `-U NAME` / `--username` | Cluster superuser name |
+| `-v` / `--verbose` | Enable verbose internal logging |
+| `--clone` | Clone files to new cluster (requires reflink support) |
+| `--copy` | Copy files to new cluster (default) |
+| `--copy-file-range` | Copy files using `copy_file_range` syscall |
+| `--no-statistics` | Do not import statistics from old cluster |
+| `--swap` | Swap data directories between old and new cluster |
+
+## Step-by-step upgrade
+
+This example upgrades from PostgreSQL 16 to PostgreSQL 17.
+
+<Steps>
+  <Step title="Pre-upgrade checks">
+Run `pg_upgrade --check` to verify that the upgrade can proceed without making any changes:
+
+```bash
+pg_upgrade \
+  -b /usr/lib/postgresql/16/bin \
+  -B /usr/lib/postgresql/17/bin \
+  -d /var/lib/postgresql/16/main \
+  -D /var/lib/postgresql/17/main \
+  --check
+```
+
+This checks for:
+- Version compatibility
+- Encoding and locale settings match
+- Extensions compatibility
+- No users objects in `pg_catalog` or `information_schema`
+- No `reg*` data types referencing system OIDs
+
+Fix any issues reported before proceeding.
+  </Step>
+  <Step title="Initialize the new cluster">
+Create a new data directory using `initdb` from the new PostgreSQL version. Use the same encoding, locale, and data checksums settings as the old cluster:
+
+```bash
+/usr/lib/postgresql/17/bin/initdb \
+  -D /var/lib/postgresql/17/main \
+  --encoding=UTF8 \
+  --locale=en_US.UTF-8 \
+  --data-checksums
+```
+  </Step>
+  <Step title="Stop the old server">
+```bash
+/usr/lib/postgresql/16/bin/pg_ctl stop \
+  -D /var/lib/postgresql/16/main \
+  -m fast
+```
+
+Verify it is stopped:
+
+```bash
+/usr/lib/postgresql/16/bin/pg_ctl status \
+  -D /var/lib/postgresql/16/main
+# pg_ctl: no server running
+```
+  </Step>
+  <Step title="Stop the new server (if running)">
+The new cluster must also be shut down before `pg_upgrade` runs:
+
+```bash
+/usr/lib/postgresql/17/bin/pg_ctl stop \
+  -D /var/lib/postgresql/17/main \
+  -m fast
+```
+  </Step>
+  <Step title="Run pg_upgrade">
+```bash
+pg_upgrade \
+  -b /usr/lib/postgresql/16/bin \
+  -B /usr/lib/postgresql/17/bin \
+  -d /var/lib/postgresql/16/main \
+  -D /var/lib/postgresql/17/main
+```
+
+For faster upgrades using hard links (the old cluster's data directory becomes unusable if you roll back):
+
+```bash
+pg_upgrade \
+  -b /usr/lib/postgresql/16/bin \
+  -B /usr/lib/postgresql/17/bin \
+  -d /var/lib/postgresql/16/main \
+  -D /var/lib/postgresql/17/main \
+  --link
+```
+  </Step>
+  <Step title="Start the new server">
+```bash
+/usr/lib/postgresql/17/bin/pg_ctl start \
+  -D /var/lib/postgresql/17/main \
+  -l /var/log/postgresql/postgresql-17.log
+```
+  </Step>
+  <Step title="Run post-upgrade scripts">
+`pg_upgrade` generates two shell scripts in the current directory.
+
+Run `analyze_new_cluster.sh` to update the optimizer statistics on the new cluster. This is important for query performance:
+
+```bash
+./analyze_new_cluster.sh
+```
+
+Once you are satisfied with the new cluster, delete the old cluster's data files:
+
+```bash
+./delete_old_cluster.sh
+```
+  </Step>
+</Steps>
+
+## Link mode for fast upgrades
+
+By default, `pg_upgrade` copies data files from the old cluster to the new one. For very large databases this can take a long time. `--link` mode uses hard links instead, which is nearly instantaneous:
+
+```bash
+pg_upgrade ... --link
+```
+
+<Warning>
+With `--link`, the old and new clusters share the underlying data files. If you need to roll back, you must not start the old cluster again after the new one has been started (doing so would corrupt the shared files). Without `--link`, rolling back is safe — simply start the old cluster again and discard the new one.
+</Warning>
+
+Modern Linux filesystems (btrfs, XFS with reflink) support `--clone`, which is like `--link` in speed but provides copy-on-write semantics, making rollback safe:
+
+```bash
+pg_upgrade ... --clone
+```
+
+## Rollback procedure
+
+If the upgrade fails or you want to revert:
+
+<Steps>
+  <Step title="Stop the new cluster">
+```bash
+/usr/lib/postgresql/17/bin/pg_ctl stop -D /var/lib/postgresql/17/main -m fast
+```
+  </Step>
+  <Step title="Start the old cluster">
+```bash
+/usr/lib/postgresql/16/bin/pg_ctl start -D /var/lib/postgresql/16/main
+```
+
+<Warning>
+If you used `--link` mode and already started the new cluster, do not start the old cluster. The shared files may have been modified by the new cluster.
+</Warning>
+  </Step>
+  <Step title="Drop the new cluster's data directory">
+```bash
+rm -rf /var/lib/postgresql/17/main
+```
+  </Step>
+</Steps>
+
+## Parallel upgrade
+
+Use `-j` to speed up the file transfer and post-upgrade steps by using multiple CPU cores:
+
+```bash
+pg_upgrade \
+  -b /usr/lib/postgresql/16/bin \
+  -B /usr/lib/postgresql/17/bin \
+  -d /var/lib/postgresql/16/main \
+  -D /var/lib/postgresql/17/main \
+  -j 8
+```
+
+## Using environment variables
+
+You can also specify directories through environment variables instead of command-line flags:
+
+```bash
+export PGDATAOLD=/var/lib/postgresql/16/main
+export PGDATANEW=/var/lib/postgresql/17/main
+export PGBINOLD=/usr/lib/postgresql/16/bin
+export PGBINNEW=/usr/lib/postgresql/17/bin
+
+pg_upgrade --check
+pg_upgrade
+```

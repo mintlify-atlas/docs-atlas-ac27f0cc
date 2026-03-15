@@ -1,0 +1,313 @@
+---
+title: 'Queries'
+description: 'SELECT syntax, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CTEs, UNION/INTERSECT/EXCEPT, subqueries, and LATERAL in PostgreSQL.'
+---
+
+The `SELECT` command retrieves rows from one or more tables. The general form is:
+
+```sql
+[ WITH with_query [, ...] ]
+SELECT [ DISTINCT ] select_list
+FROM table_expression
+[ WHERE condition ]
+[ GROUP BY grouping_columns ]
+[ HAVING group_condition ]
+[ { UNION | INTERSECT | EXCEPT } [ ALL ] query ]
+[ ORDER BY sort_expression [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [, ...] ]
+[ LIMIT { count | ALL } ]
+[ OFFSET start ]
+```
+
+## SELECT list
+
+```sql
+-- All columns
+SELECT * FROM products;
+
+-- Specific columns
+SELECT product_no, name, price FROM products;
+
+-- Computed expressions with aliases
+SELECT product_no, name, price * 1.1 AS price_with_tax FROM products;
+
+-- Eliminate duplicates
+SELECT DISTINCT category FROM products;
+```
+
+## FROM clause
+
+The `FROM` clause lists tables, subqueries, joins, and table functions.
+
+```sql
+-- Single table
+SELECT * FROM orders;
+
+-- With schema qualification
+SELECT * FROM sales.orders;
+
+-- Multiple tables (implicit cross join)
+SELECT * FROM customers, orders WHERE customers.id = orders.customer_id;
+
+-- Subquery as derived table
+SELECT avg_price
+FROM (
+    SELECT category, AVG(price) AS avg_price
+    FROM products
+    GROUP BY category
+) AS cat_averages
+WHERE avg_price > 50;
+```
+
+## WHERE clause
+
+The `WHERE` clause filters rows before grouping and aggregation.
+
+```sql
+SELECT * FROM products WHERE price > 100;
+
+SELECT * FROM products WHERE category IN ('electronics', 'appliances');
+
+SELECT * FROM orders WHERE created_at >= '2024-01-01';
+
+-- Correlated subquery
+SELECT * FROM products p
+WHERE price > (SELECT AVG(price) FROM products WHERE category = p.category);
+
+-- EXISTS
+SELECT * FROM customers c
+WHERE EXISTS (
+    SELECT 1 FROM orders o WHERE o.customer_id = c.id
+);
+```
+
+## GROUP BY and HAVING
+
+`GROUP BY` groups rows with the same values into summary rows. `HAVING` filters the groups.
+
+```sql
+SELECT category, COUNT(*) AS cnt, AVG(price) AS avg_price
+FROM products
+GROUP BY category;
+```
+
+```sql
+-- HAVING filters after grouping; WHERE filters before
+SELECT customer_id, SUM(total) AS revenue
+FROM orders
+WHERE created_at >= '2024-01-01'
+GROUP BY customer_id
+HAVING SUM(total) > 1000
+ORDER BY revenue DESC;
+```
+
+### GROUPING SETS, ROLLUP, CUBE
+
+```sql
+-- Multiple grouping combinations in one query
+SELECT region, product, SUM(sales)
+FROM sales_data
+GROUP BY GROUPING SETS ((region, product), (region), ());
+
+-- ROLLUP generates subtotals
+SELECT year, quarter, SUM(revenue)
+FROM revenue_data
+GROUP BY ROLLUP (year, quarter);
+
+-- CUBE generates all combinations
+SELECT region, category, SUM(sales)
+FROM sales
+GROUP BY CUBE (region, category);
+```
+
+## ORDER BY
+
+```sql
+SELECT name, price FROM products ORDER BY price ASC;
+
+-- Multiple sort keys
+SELECT name, price FROM products ORDER BY price DESC, name ASC;
+
+-- Null ordering (nulls last by default for ASC)
+SELECT name, score FROM rankings ORDER BY score DESC NULLS LAST;
+
+-- Reference output column by alias
+SELECT name, price * 1.1 AS adjusted_price
+FROM products
+ORDER BY adjusted_price;
+```
+
+## LIMIT and OFFSET
+
+```sql
+-- First 10 rows
+SELECT * FROM products ORDER BY product_no LIMIT 10;
+
+-- Pagination: skip the first 20 rows, return the next 10
+SELECT * FROM products ORDER BY product_no LIMIT 10 OFFSET 20;
+```
+
+<Warning>
+Always include an `ORDER BY` clause when using `LIMIT`/`OFFSET`. Without it, the returned rows are non-deterministic. Also note that large `OFFSET` values are inefficient because the server must compute and discard the skipped rows.
+</Warning>
+
+## Subqueries
+
+```sql
+-- Scalar subquery
+SELECT name, price,
+       (SELECT AVG(price) FROM products) AS global_avg
+FROM products;
+
+-- Subquery in FROM (derived table)
+SELECT t.category, t.avg_price
+FROM (
+    SELECT category, AVG(price) AS avg_price
+    FROM products GROUP BY category
+) AS t
+WHERE t.avg_price > 50;
+
+-- Subquery in WHERE with IN
+SELECT * FROM orders
+WHERE customer_id IN (SELECT id FROM customers WHERE country = 'US');
+
+-- Subquery with ANY / ALL
+SELECT name, price FROM products
+WHERE price > ALL (SELECT price FROM competitor_prices);
+```
+
+## LATERAL subqueries
+
+A `LATERAL` subquery can reference columns from preceding `FROM` items. Without `LATERAL`, subqueries are evaluated independently.
+
+```sql
+-- LATERAL allows the subquery to reference the outer table
+SELECT c.name, recent.order_date, recent.total
+FROM customers c,
+     LATERAL (
+         SELECT order_date, total
+         FROM orders
+         WHERE customer_id = c.id
+         ORDER BY order_date DESC
+         LIMIT 3
+     ) AS recent;
+
+-- LEFT JOIN LATERAL preserves customers with no orders
+SELECT c.name, recent.order_date
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT order_date FROM orders
+    WHERE customer_id = c.id
+    ORDER BY order_date DESC
+    LIMIT 1
+) AS recent ON true;
+```
+
+## CTEs (WITH queries)
+
+Common Table Expressions define named subqueries that exist for the duration of a single query. They improve readability and allow referencing the same result set multiple times.
+
+```sql
+WITH regional_sales AS (
+    SELECT region, SUM(amount) AS total_sales
+    FROM orders
+    GROUP BY region
+),
+top_regions AS (
+    SELECT region
+    FROM regional_sales
+    WHERE total_sales > (SELECT SUM(total_sales) / 10 FROM regional_sales)
+)
+SELECT region,
+       product,
+       SUM(quantity)  AS product_units,
+       SUM(amount)    AS product_sales
+FROM orders
+WHERE region IN (SELECT region FROM top_regions)
+GROUP BY region, product;
+```
+
+### Recursive CTEs
+
+`WITH RECURSIVE` allows a CTE to reference its own output, useful for hierarchical or graph data.
+
+```sql
+-- Sum integers 1 through 100
+WITH RECURSIVE t(n) AS (
+    VALUES (1)
+  UNION ALL
+    SELECT n + 1 FROM t WHERE n < 100
+)
+SELECT sum(n) FROM t;
+```
+
+```sql
+-- Traverse an employee hierarchy
+WITH RECURSIVE subordinates AS (
+    -- Anchor: start with the CEO
+    SELECT id, name, manager_id, 0 AS depth
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    -- Recursive: employees managed by someone already in the result
+    SELECT e.id, e.name, e.manager_id, s.depth + 1
+    FROM employees e
+    JOIN subordinates s ON e.manager_id = s.id
+)
+SELECT id, name, depth FROM subordinates ORDER BY depth, name;
+```
+
+<Note>
+By default, CTEs are optimization fences in PostgreSQL 11 and earlier — the planner cannot push conditions inside them. From PostgreSQL 12, CTEs that are referenced only once and do not contain DML are automatically inlined. Use `WITH ... AS MATERIALIZED` to force materialization or `AS NOT MATERIALIZED` to force inlining.
+</Note>
+
+## UNION, INTERSECT, EXCEPT
+
+Combine the results of two queries. Both queries must return the same number of columns with compatible types.
+
+```sql
+-- All customers and suppliers (deduplicates by default)
+SELECT name FROM customers
+UNION
+SELECT name FROM suppliers;
+
+-- Include duplicates
+SELECT name FROM customers
+UNION ALL
+SELECT name FROM suppliers;
+
+-- Only names that appear in both tables
+SELECT name FROM customers
+INTERSECT
+SELECT name FROM suppliers;
+
+-- Names in customers but not in suppliers
+SELECT name FROM customers
+EXCEPT
+SELECT name FROM suppliers;
+```
+
+`INTERSECT` binds more tightly than `UNION` and `EXCEPT`. Use parentheses to control evaluation order.
+
+## VALUES
+
+`VALUES` provides an inline constant table.
+
+```sql
+SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) AS t (num, label);
+
+-- Used directly in INSERT
+INSERT INTO colors (id, name) VALUES (1, 'red'), (2, 'green'), (3, 'blue');
+```
+
+## Window functions
+
+Window functions compute values across a set of rows related to the current row without collapsing them. See [Window functions](/sql/window-functions) for full coverage.
+
+```sql
+SELECT name, salary,
+       AVG(salary) OVER (PARTITION BY department) AS dept_avg,
+       ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) AS rank
+FROM employees;
+```

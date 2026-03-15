@@ -1,0 +1,476 @@
+---
+title: PL/pgSQL — SQL procedural language
+description: Write stored functions, procedures, and triggers in PL/pgSQL, PostgreSQL's native procedural language. Covers block structure, control flow, dynamic SQL, cursors, and error handling.
+---
+
+PL/pgSQL is a loadable procedural language for PostgreSQL. It adds control structures, variable declarations, and procedural logic to SQL, keeping computation inside the server and eliminating round-trips.
+
+PL/pgSQL has been installed by default since PostgreSQL 9.0.
+
+<CardGroup cols={2}>
+  <Card title="Functions and procedures" icon="function">
+    Create `RETURNS` functions or `CALL`-able procedures.
+  </Card>
+  <Card title="Triggers" icon="bolt">
+    Write row-level and statement-level trigger functions.
+  </Card>
+  <Card title="Control flow" icon="code-branch">
+    IF/ELSIF/ELSE, CASE, LOOP, WHILE, FOR, FOREACH.
+  </Card>
+  <Card title="Dynamic SQL" icon="database">
+    Execute SQL strings built at runtime with EXECUTE.
+  </Card>
+</CardGroup>
+
+## Block structure
+
+A PL/pgSQL function body is a single block:
+
+```sql
+[ <<label>> ]
+[ DECLARE
+    declarations ]
+BEGIN
+    statements
+[ EXCEPTION
+    WHEN condition THEN
+        handler_statements ]
+END [ label ];
+```
+
+<Tip>
+Do not put a semicolon immediately after `BEGIN`. That is a syntax error.
+</Tip>
+
+`BEGIN`/`END` in PL/pgSQL are block delimiters, not transaction control commands.
+
+**Example — nested blocks with labels:**
+
+```sql
+CREATE FUNCTION somefunc() RETURNS integer AS $$
+<<outerblock>>
+DECLARE
+    quantity integer := 30;
+BEGIN
+    RAISE NOTICE 'Quantity here is %', quantity;  -- prints 30
+    quantity := 50;
+    DECLARE
+        quantity integer := 80;
+    BEGIN
+        RAISE NOTICE 'Quantity here is %', quantity;          -- prints 80
+        RAISE NOTICE 'Outer quantity here is %', outerblock.quantity;  -- prints 50
+    END;
+    RAISE NOTICE 'Quantity here is %', quantity;  -- prints 50
+    RETURN quantity;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+## Variable declarations
+
+All variables must be declared in the `DECLARE` section. The general syntax is:
+
+```sql
+name [ CONSTANT ] type [ COLLATE collation_name ] [ NOT NULL ] [ { DEFAULT | := | = } expression ];
+```
+
+**Examples:**
+
+```sql
+DECLARE
+    quantity        integer DEFAULT 32;
+    url             varchar := 'https://example.com';
+    tx_time         CONSTANT timestamp with time zone := now();
+    myrow           tablename%ROWTYPE;         -- row type anchored to a table
+    myfield         tablename.colname%TYPE;    -- type anchored to a column
+    arow            RECORD;                   -- unstructured record
+    user_id         integer NOT NULL := 1;    -- NOT NULL requires a default
+```
+
+### Function parameters
+
+Parameters are named `$1`, `$2`, etc., or by their name given in `CREATE FUNCTION`:
+
+```sql
+CREATE FUNCTION sales_tax(subtotal real) RETURNS real AS $$
+BEGIN
+    RETURN subtotal * 0.06;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+You can also declare aliases in the function body:
+
+```sql
+CREATE FUNCTION sales_tax(real) RETURNS real AS $$
+DECLARE
+    subtotal ALIAS FOR $1;
+BEGIN
+    RETURN subtotal * 0.06;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+## Assignment
+
+```sql
+variable { := | = } expression;
+```
+
+```sql
+tax := subtotal * 0.06;
+my_record.user_id := 20;
+my_array[j] := 20;
+my_array[1:3] := ARRAY[1, 2, 3];
+```
+
+## Control structures
+
+### IF / ELSIF / ELSE
+
+```sql
+IF boolean_expression THEN
+    statements
+ELSIF boolean_expression THEN
+    statements
+ELSE
+    statements
+END IF;
+```
+
+### CASE
+
+```sql
+-- Searched CASE
+CASE
+    WHEN condition1 THEN
+        statements
+    WHEN condition2 THEN
+        statements
+    ELSE
+        statements
+END CASE;
+
+-- Simple CASE
+CASE search_expression
+    WHEN value1 THEN statements
+    WHEN value2 THEN statements
+    ELSE statements
+END CASE;
+```
+
+### LOOP
+
+```sql
+[ <<label>> ]
+LOOP
+    statements
+    EXIT [ label ] [ WHEN boolean_expression ];
+    CONTINUE [ label ] [ WHEN boolean_expression ];
+END LOOP [ label ];
+```
+
+### WHILE
+
+```sql
+[ <<label>> ]
+WHILE boolean_expression LOOP
+    statements
+END LOOP [ label ];
+```
+
+### FOR — integer range
+
+```sql
+[ <<label>> ]
+FOR i IN [ REVERSE ] lower..upper [ BY step ] LOOP
+    statements
+END LOOP [ label ];
+```
+
+```sql
+-- Count from 1 to 10
+FOR i IN 1..10 LOOP
+    RAISE NOTICE 'i = %', i;
+END LOOP;
+
+-- Count down by 2
+FOR i IN REVERSE 10..1 BY 2 LOOP ...
+```
+
+### FOR — iterating query results
+
+```sql
+[ <<label>> ]
+FOR record_var IN query LOOP
+    statements
+END LOOP [ label ];
+```
+
+```sql
+FOR rec IN SELECT * FROM employees WHERE dept = 'Engineering' LOOP
+    RAISE NOTICE 'Employee: %', rec.name;
+END LOOP;
+```
+
+### FOREACH — iterating arrays
+
+```sql
+[ <<label>> ]
+FOREACH target [ SLICE n ] IN ARRAY expression LOOP
+    statements
+END LOOP [ label ];
+```
+
+```sql
+DECLARE arr integer[] := ARRAY[1,2,3,4,5];
+        x   integer;
+BEGIN
+    FOREACH x IN ARRAY arr LOOP
+        RAISE NOTICE 'x = %', x;
+    END LOOP;
+END;
+```
+
+## RETURN, RETURN NEXT, and RETURN QUERY
+
+### Scalar functions
+
+```sql
+RETURN expression;
+```
+
+### Set-returning functions
+
+```sql
+RETURN NEXT expression;               -- add one row to result
+RETURN QUERY query;                   -- add all rows of a query
+RETURN QUERY EXECUTE command_string   -- dynamic RETURN QUERY
+    [ USING expression [, ...] ];
+```
+
+**Example — set-returning function:**
+
+```sql
+CREATE FUNCTION get_active_users()
+    RETURNS SETOF users AS $$
+DECLARE
+    r users%ROWTYPE;
+BEGIN
+    FOR r IN SELECT * FROM users WHERE active = true LOOP
+        RETURN NEXT r;
+    END LOOP;
+    -- alternatively:
+    -- RETURN QUERY SELECT * FROM users WHERE active = true;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+## Executing SQL commands
+
+### Single-row results
+
+```sql
+SELECT col1, col2 INTO [STRICT] target FROM ...;
+INSERT ... RETURNING expr INTO [STRICT] target;
+UPDATE ... RETURNING expr INTO [STRICT] target;
+DELETE ... RETURNING expr INTO [STRICT] target;
+```
+
+With `STRICT`, an error is raised if the query returns zero or more than one row. Without `STRICT`, the first row is used; if no rows are returned, target variables are set to NULL.
+
+### Checking results with FOUND
+
+`FOUND` is a boolean variable set automatically after most SQL statements:
+
+```sql
+SELECT id INTO rec FROM users WHERE name = 'Alice';
+IF NOT FOUND THEN
+    RAISE EXCEPTION 'User Alice not found';
+END IF;
+```
+
+## Dynamic SQL with EXECUTE
+
+Use `EXECUTE` to run SQL built as a string at runtime:
+
+```sql
+EXECUTE command_string [ INTO [STRICT] target ]
+    [ USING expression [, ...] ];
+```
+
+```sql
+-- Bad: vulnerable to SQL injection
+EXECUTE 'SELECT * FROM ' || tablename;
+
+-- Good: use format() with %I for identifiers, %L for literals
+EXECUTE format('UPDATE %I SET %I = $1 WHERE key = $2', tablename, colname)
+    USING newvalue, keyvalue;
+```
+
+<Warning>
+Always use `quote_ident()` / `%I` for identifiers and `quote_literal()` / `quote_nullable()` / `%L` for values in dynamic SQL. Never concatenate user-supplied strings directly.
+</Warning>
+
+## Cursors
+
+```sql
+DECLARE
+    curs1 refcursor;                              -- unbound cursor
+    curs2 CURSOR FOR SELECT * FROM accounts;      -- bound cursor
+    curs3 CURSOR (key integer) FOR               -- cursor with arguments
+              SELECT * FROM orders WHERE id = key;
+```
+
+```sql
+-- Open an unbound cursor
+OPEN curs1 FOR SELECT * FROM users WHERE active = true;
+OPEN curs1 FOR EXECUTE 'SELECT * FROM ' || quote_ident(tablename);
+
+-- Open a bound cursor
+OPEN curs2;
+OPEN curs3(key := 42);
+
+-- Fetch
+FETCH NEXT FROM curs1 INTO rec;
+FETCH PRIOR FROM curs1 INTO rec;
+FETCH FIRST FROM curs1 INTO rec;
+FETCH LAST FROM curs1 INTO rec;
+FETCH RELATIVE -1 FROM curs1 INTO rec;
+FETCH ABSOLUTE 5 FROM curs1 INTO rec;
+
+-- Positioned update/delete
+UPDATE accounts SET balance = 0 WHERE CURRENT OF curs2;
+
+-- Close
+CLOSE curs1;
+```
+
+## Errors and messages
+
+### RAISE
+
+```sql
+RAISE [ level ] 'format' [, expression [, ...]] [ USING option = expression ];
+RAISE [ level ] condition_name [ USING option = expression ];
+RAISE [ level ] SQLSTATE 'code' [ USING option = expression ];
+RAISE;   -- re-raise current exception (in EXCEPTION block)
+```
+
+Levels: `DEBUG`, `LOG`, `INFO`, `NOTICE`, `WARNING`, `EXCEPTION` (default). Only `EXCEPTION` aborts the current transaction.
+
+```sql
+RAISE NOTICE 'Processing job id %', v_job_id;
+RAISE WARNING 'Balance is low: %', balance;
+RAISE EXCEPTION 'Invalid state: %', state
+    USING ERRCODE = 'P0001', HINT = 'Check the state table';
+RAISE division_by_zero;
+RAISE SQLSTATE '22012';
+```
+
+### EXCEPTION blocks
+
+```sql
+BEGIN
+    -- statements that might fail
+    UPDATE accounts SET balance = balance - amount WHERE id = src_id;
+    UPDATE accounts SET balance = balance + amount WHERE id = dst_id;
+EXCEPTION
+    WHEN insufficient_privilege THEN
+        RAISE EXCEPTION 'Permission denied on transfer';
+    WHEN OTHERS THEN
+        -- log the error and re-raise
+        RAISE NOTICE 'Transfer failed: %', SQLERRM;
+        RAISE;
+END;
+```
+
+Inside an `EXCEPTION` handler, these variables are available:
+
+| Variable | Description |
+|----------|-------------|
+| `SQLSTATE` | Five-character SQLSTATE error code |
+| `SQLERRM` | Error message text |
+
+You can also use `GET STACKED DIAGNOSTICS` to retrieve additional details.
+
+## Trigger functions
+
+A trigger function must return `TRIGGER` and takes no arguments. PostgreSQL populates special variables automatically:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `TG_OP` | text | `'INSERT'`, `'UPDATE'`, `'DELETE'`, or `'TRUNCATE'` |
+| `TG_TABLE_NAME` | name | Table that fired the trigger |
+| `TG_TABLE_SCHEMA` | name | Schema of that table |
+| `TG_WHEN` | text | `'BEFORE'`, `'AFTER'`, or `'INSTEAD OF'` |
+| `TG_LEVEL` | text | `'ROW'` or `'STATEMENT'` |
+| `NEW` | RECORD | New row (INSERT/UPDATE); NULL for DELETE |
+| `OLD` | RECORD | Old row (UPDATE/DELETE); NULL for INSERT |
+| `TG_ARGV` | text[] | Arguments from `CREATE TRIGGER ... EXECUTE FUNCTION name(args)` |
+
+**Example — audit trigger:**
+
+```sql
+CREATE TABLE emp (
+    empname text NOT NULL,
+    salary  integer
+);
+
+CREATE TABLE emp_audit (
+    operation char(1)   NOT NULL,
+    stamp     timestamp NOT NULL,
+    userid    text      NOT NULL,
+    empname   text      NOT NULL,
+    salary    integer
+);
+
+CREATE OR REPLACE FUNCTION process_emp_audit() RETURNS TRIGGER AS $body$
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        INSERT INTO emp_audit VALUES ('D', now(), current_user, OLD.empname, OLD.salary);
+        RETURN OLD;
+    ELSIF (TG_OP = 'UPDATE') THEN
+        INSERT INTO emp_audit VALUES ('U', now(), current_user, NEW.empname, NEW.salary);
+        RETURN NEW;
+    ELSIF (TG_OP = 'INSERT') THEN
+        INSERT INTO emp_audit VALUES ('I', now(), current_user, NEW.empname, NEW.salary);
+        RETURN NEW;
+    END IF;
+    RETURN NULL;
+END;
+$body$ LANGUAGE plpgsql;
+
+CREATE TRIGGER emp_audit_trigger
+    AFTER INSERT OR UPDATE OR DELETE ON emp
+    FOR EACH ROW EXECUTE FUNCTION process_emp_audit();
+```
+
+<Note>
+For `BEFORE` row triggers, returning `NULL` suppresses the operation. Returning `NEW` (possibly modified) proceeds with the modified row. For `AFTER` triggers the return value is ignored.
+</Note>
+
+## Transaction control in procedures
+
+PL/pgSQL procedures invoked via `CALL` can commit and roll back transactions:
+
+```sql
+CREATE PROCEDURE transaction_test()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    FOR i IN 0..9 LOOP
+        INSERT INTO test1 (a) VALUES (i);
+        IF i % 2 = 0 THEN
+            COMMIT;
+        ELSE
+            ROLLBACK;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+CALL transaction_test();
+```
+
+Transaction control is not available inside functions (only procedures) and is not allowed inside exception handlers.

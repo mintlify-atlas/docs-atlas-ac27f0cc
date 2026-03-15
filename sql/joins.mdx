@@ -1,0 +1,241 @@
+---
+title: 'Joins'
+description: 'INNER JOIN, LEFT/RIGHT/FULL OUTER JOIN, CROSS JOIN, NATURAL JOIN, and self-joins in PostgreSQL, with examples using multiple tables.'
+---
+
+Joins combine rows from two or more tables based on a related column. PostgreSQL supports all standard join types.
+
+## Sample tables
+
+The examples on this page use two tables:
+
+```sql
+CREATE TABLE t1 (num integer, name text);
+CREATE TABLE t2 (num integer, value text);
+
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO t2 VALUES (1, 'xxx'), (3, 'yyy'), (5, 'zzz');
+```
+
+## INNER JOIN
+
+Returns only the rows where the join condition matches in both tables.
+
+```sql
+SELECT * FROM t1 INNER JOIN t2 ON t1.num = t2.num;
+```
+
+```
+ num | name | num | value
+-----+------+-----+-------
+   1 | a    |   1 | xxx
+   3 | c    |   3 | yyy
+```
+
+The keyword `INNER` is optional; `JOIN` alone is an inner join.
+
+### USING clause
+
+When the join column has the same name in both tables, `USING` is a shorthand:
+
+```sql
+SELECT * FROM t1 JOIN t2 USING (num);
+```
+
+```
+ num | name | value
+-----+------+-------
+   1 | a    | xxx
+   3 | c    | yyy
+```
+
+`JOIN USING` produces a single output column for each listed column (instead of one from each table).
+
+## LEFT OUTER JOIN
+
+Returns all rows from the left table, and matching rows from the right table. Where there is no match, the right-table columns are `NULL`.
+
+```sql
+SELECT * FROM t1 LEFT JOIN t2 ON t1.num = t2.num;
+```
+
+```
+ num | name | num | value
+-----+------+-----+-------
+   1 | a    |   1 | xxx
+   2 | b    |     |
+   3 | c    |   3 | yyy
+```
+
+Row 2 (`b`) has no match in `t2`, so its `t2` columns are null.
+
+## RIGHT OUTER JOIN
+
+Returns all rows from the right table, and matching rows from the left table. Where there is no match, the left-table columns are `NULL`.
+
+```sql
+SELECT * FROM t1 RIGHT JOIN t2 ON t1.num = t2.num;
+```
+
+```
+ num | name | num | value
+-----+------+-----+-------
+   1 | a    |   1 | xxx
+   3 | c    |   3 | yyy
+     |      |   5 | zzz
+```
+
+Row 5 (`zzz`) has no match in `t1`, so its `t1` columns are null.
+
+## FULL OUTER JOIN
+
+Returns all rows from both tables. Where there is no match on either side, the missing columns are `NULL`.
+
+```sql
+SELECT * FROM t1 FULL JOIN t2 ON t1.num = t2.num;
+```
+
+```
+ num | name | num | value
+-----+------+-----+-------
+   1 | a    |   1 | xxx
+   2 | b    |     |
+   3 | c    |   3 | yyy
+     |      |   5 | zzz
+```
+
+## CROSS JOIN
+
+Produces the Cartesian product: every row from the left table paired with every row from the right table.
+
+```sql
+SELECT * FROM t1 CROSS JOIN t2;
+-- 3 rows in t1 * 3 rows in t2 = 9 result rows
+```
+
+`FROM t1 CROSS JOIN t2` is equivalent to `FROM t1, t2` (implicit cross join).
+
+<Warning>
+A CROSS JOIN on large tables produces an enormous result set. Make sure this is intentional.
+</Warning>
+
+## NATURAL JOIN
+
+`NATURAL JOIN` automatically constructs a join condition by matching all columns that have the same name in both tables.
+
+```sql
+SELECT * FROM t1 NATURAL INNER JOIN t2;
+```
+
+```
+ num | name | value
+-----+------+-------
+   1 | a    | xxx
+   3 | c    | yyy
+```
+
+<Warning>
+Avoid `NATURAL JOIN` in production code. Any future column added to either table with a matching name in the other will silently change join behavior.
+</Warning>
+
+## Join conditions: ON vs USING vs WHERE
+
+For inner joins, these three forms are equivalent:
+
+```sql
+FROM orders o, customers c WHERE o.customer_id = c.id
+FROM orders o INNER JOIN customers c ON o.customer_id = c.id
+FROM orders o INNER JOIN customers c USING (customer_id)
+```
+
+For outer joins, the placement matters:
+
+```sql
+-- Condition in ON: row 2 appears with NULLs (outer join preserved)
+SELECT * FROM t1 LEFT JOIN t2 ON t1.num = t2.num AND t2.value = 'xxx';
+
+-- Condition in WHERE: row 2 is eliminated (effectively becomes an inner join)
+SELECT * FROM t1 LEFT JOIN t2 ON t1.num = t2.num WHERE t2.value = 'xxx';
+```
+
+## Self-join
+
+A table can be joined to itself using aliases. Common for hierarchical data.
+
+```sql
+SELECT
+    e.name        AS employee,
+    m.name        AS manager
+FROM employees e
+LEFT JOIN employees m ON e.manager_id = m.id
+ORDER BY manager, employee;
+```
+
+```sql
+-- Find pairs of products in the same category with overlapping price ranges
+SELECT a.name, b.name, a.price, b.price
+FROM products a
+JOIN products b ON a.category = b.category
+                AND a.product_no < b.product_no  -- avoid duplicates
+WHERE ABS(a.price - b.price) < 5;
+```
+
+## Multi-table joins
+
+Joins chain left-to-right unless parenthesized.
+
+```sql
+SELECT
+    c.name      AS customer,
+    o.order_id,
+    p.name      AS product,
+    oi.quantity
+FROM customers c
+JOIN orders o      ON c.id = o.customer_id
+JOIN order_items oi ON o.order_id = oi.order_id
+JOIN products p    ON oi.product_no = p.product_no
+WHERE o.created_at >= '2024-01-01'
+ORDER BY c.name, o.order_id;
+```
+
+## Table aliases
+
+Aliases shorten long table names and are required for self-joins:
+
+```sql
+SELECT
+    child.name   AS department,
+    parent.name  AS parent_department
+FROM departments child
+JOIN departments parent ON child.parent_id = parent.id;
+```
+
+## LATERAL joins
+
+`LATERAL` allows a subquery in `FROM` to reference columns from tables earlier in the `FROM` list.
+
+```sql
+-- Top 3 recent orders per customer
+SELECT c.name, recent.order_id, recent.total
+FROM customers c
+CROSS JOIN LATERAL (
+    SELECT order_id, total
+    FROM orders
+    WHERE customer_id = c.id
+    ORDER BY created_at DESC
+    LIMIT 3
+) AS recent;
+```
+
+Use `LEFT JOIN LATERAL` to preserve customers who have no orders:
+
+```sql
+SELECT c.name, recent.order_id
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT order_id FROM orders
+    WHERE customer_id = c.id
+    ORDER BY created_at DESC LIMIT 1
+) AS recent ON true
+WHERE recent.order_id IS NULL;  -- customers with no orders
+```

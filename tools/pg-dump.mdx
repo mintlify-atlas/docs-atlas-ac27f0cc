@@ -1,0 +1,265 @@
+---
+title: pg_dump
+description: Logical backup and restore of PostgreSQL databases using pg_dump, pg_restore, and pg_dumpall.
+---
+
+`pg_dump` creates a logical backup of a single PostgreSQL database. It produces SQL scripts or archive-format files that can be used to reconstruct the database on any PostgreSQL installation.
+
+<Note>
+`pg_dump` reads data while the database is online. It is consistent — it takes a transaction snapshot at the start — but it does not lock out other users.
+</Note>
+
+## pg_dump
+
+### Basic usage
+
+```bash
+# Dump to a plain SQL file
+pg_dump -h localhost -U postgres mydb > mydb.sql
+
+# Dump to a custom-format archive (recommended for large databases)
+pg_dump -Fc -U postgres mydb -f mydb.dump
+
+# Dump to a directory-format archive (supports parallel jobs)
+pg_dump -Fd -U postgres mydb -f mydb_dir/ -j 4
+```
+
+### Format options (`-F`)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `p` | plain | Plain-text SQL script (default). Can be piped directly to `psql`. |
+| `c` | custom | Compressed binary archive. Supports selective restore and parallel restore. |
+| `d` | directory | One file per table in a directory. Supports parallel dump and restore. |
+| `t` | tar | Tar archive. Useful for portability, but does not support parallel restore. |
+
+<Tip>
+Use custom format (`-Fc`) for production backups. It compresses by default, supports parallel restore with `pg_restore -j`, and allows selective object restore.
+</Tip>
+
+### Selecting what to dump
+
+```bash
+# Dump only a specific table
+pg_dump -Fc -t orders mydb -f orders.dump
+
+# Dump multiple tables matching a pattern
+pg_dump -Fc -t 'public.order*' mydb -f orders.dump
+
+# Dump a specific schema
+pg_dump -Fc -n reporting mydb -f reporting.dump
+
+# Exclude a table
+pg_dump -Fc -T logs mydb -f mydb_no_logs.dump
+
+# Exclude a schema
+pg_dump -Fc --exclude-schema=archive mydb -f mydb.dump
+```
+
+### Controlling output content
+
+| Flag | Description |
+|------|-------------|
+| `--no-owner` | Do not output commands to set ownership of objects |
+| `--no-privileges` / `--no-acl` | Do not dump GRANT/REVOKE commands |
+| `--schema-only` | Dump only the object definitions, not data |
+| `--data-only` | Dump only data, not schema |
+| `--inserts` | Use INSERT statements instead of COPY |
+| `--column-inserts` | Use INSERT statements with explicit column names |
+| `--no-comments` | Do not dump comments |
+| `--no-publications` | Do not dump publications |
+| `--no-subscriptions` | Do not dump subscriptions |
+
+### Compression
+
+```bash
+# Compress at level 9 (maximum, default for custom format)
+pg_dump -Fc -Z 9 mydb -f mydb.dump
+
+# No compression
+pg_dump -Fc -Z 0 mydb -f mydb.dump
+```
+
+With PostgreSQL 16+, you can also specify the compression algorithm:
+
+```bash
+pg_dump -Fc --compress=zstd mydb -f mydb.dump
+```
+
+### Parallel dump (directory format only)
+
+```bash
+# Use 4 parallel worker processes
+pg_dump -Fd -j 4 -U postgres mydb -f mydb_dir/
+```
+
+### All options
+
+| Flag | Description |
+|------|-------------|
+| `-F FORMAT` / `--format` | Output file format (see above) |
+| `-f FILE` / `--file` | Output file or directory name |
+| `-t PATTERN` / `--table` | Dump only matching tables |
+| `-T PATTERN` / `--exclude-table` | Exclude matching tables |
+| `-n SCHEMA` / `--schema` | Dump only matching schemas |
+| `-N SCHEMA` / `--exclude-schema` | Exclude matching schemas |
+| `-j NUM` / `--jobs` | Number of parallel worker processes (directory format only) |
+| `-Z LEVEL` / `--compress` | Compression level |
+| `--inserts` | Use INSERT instead of COPY |
+| `--column-inserts` | Use INSERT with explicit column names |
+| `--no-owner` | Skip ownership commands |
+| `--no-privileges` | Skip GRANT/REVOKE commands |
+| `--schema-only` | Schema only, no data |
+| `--data-only` | Data only, no schema |
+| `-v` / `--verbose` | Verbose messages |
+| `-U USERNAME` | Connect as username |
+| `-h HOST` | Database server host |
+| `-p PORT` | Database server port |
+| `-d DBNAME` | Database name |
+
+---
+
+## pg_restore
+
+`pg_restore` restores a PostgreSQL database from an archive created by `pg_dump` in custom, directory, or tar format. Plain SQL files must be restored with `psql`.
+
+### Basic usage
+
+```bash
+# Create the database first, then restore
+createdb -U postgres mydb_restored
+pg_restore -U postgres -d mydb_restored mydb.dump
+
+# Or create and restore in one step
+pg_restore -U postgres -C -d postgres mydb.dump
+```
+
+### Key options
+
+| Flag | Description |
+|------|-------------|
+| `-d DBNAME` | Connect to this database and restore into it |
+| `-F FORMAT` | Archive format (usually auto-detected) |
+| `-j NUM` / `--jobs` | Number of parallel restore workers |
+| `-t TABLE` / `--table` | Restore only the named table |
+| `-n SCHEMA` / `--schema` | Restore only the named schema |
+| `-I INDEX` / `--index` | Restore only the named index |
+| `--single-transaction` | Wrap the restore in a single transaction |
+| `-l` / `--list` | List the contents of the archive |
+| `-L FILE` / `--use-list` | Restore only objects listed in FILE |
+| `-c` / `--clean` | Drop database objects before recreating them |
+| `-C` / `--create` | Create the database before restoring |
+| `--no-owner` | Skip ownership commands |
+| `--no-privileges` | Skip GRANT/REVOKE commands |
+| `-e` / `--exit-on-error` | Exit if an error occurs during restore |
+| `-v` / `--verbose` | Verbose messages |
+
+### Parallel restore
+
+```bash
+# Use 4 parallel workers (custom and directory formats only)
+pg_restore -j 4 -U postgres -d mydb mydb.dump
+```
+
+### Selective restore
+
+```bash
+# List archive contents
+pg_restore -l mydb.dump > restore_list.txt
+
+# Edit restore_list.txt to comment out objects you don't want, then:
+pg_restore -L restore_list.txt -d mydb mydb.dump
+
+# Restore a single table
+pg_restore -t orders -d mydb mydb.dump
+
+# Restore only a specific index
+pg_restore -I orders_customer_id_idx -d mydb mydb.dump
+```
+
+---
+
+## pg_dumpall
+
+`pg_dumpall` dumps the entire PostgreSQL cluster — all databases plus global objects (roles and tablespaces) that cannot be captured by `pg_dump`.
+
+```bash
+# Full cluster dump
+pg_dumpall -U postgres -f cluster.sql
+
+# Dump only global objects (roles and tablespaces)
+pg_dumpall -U postgres --globals-only -f globals.sql
+
+# Dump only roles
+pg_dumpall -U postgres --roles-only -f roles.sql
+```
+
+<Note>
+`pg_dumpall` always produces a plain-text SQL script. Restore it with `psql`:
+
+```bash
+psql -U postgres -f cluster.sql
+```
+</Note>
+
+---
+
+## Complete backup and restore workflow
+
+<Steps>
+  <Step title="Back up the database">
+```bash
+pg_dump -Fc -h localhost -U postgres \
+  --no-password \
+  -f /backups/mydb_$(date +%Y%m%d_%H%M%S).dump \
+  mydb
+```
+  </Step>
+  <Step title="Verify the backup">
+```bash
+# List archive contents to confirm it looks correct
+pg_restore -l /backups/mydb_20240101_120000.dump | head -30
+```
+  </Step>
+  <Step title="Create a target database">
+```bash
+createdb -h newhost -U postgres mydb_restored
+```
+  </Step>
+  <Step title="Restore the backup">
+```bash
+pg_restore \
+  -h newhost \
+  -U postgres \
+  -d mydb_restored \
+  -j 4 \
+  --no-owner \
+  --no-privileges \
+  /backups/mydb_20240101_120000.dump
+```
+  </Step>
+  <Step title="Verify the restore">
+```bash
+psql -h newhost -U postgres -d mydb_restored \
+  -c "SELECT schemaname, tablename, n_live_tup FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 20;"
+```
+  </Step>
+</Steps>
+
+## Scripting with pg_dump
+
+```bash
+#!/bin/bash
+# Nightly backup script
+BACKUP_DIR=/backups
+DB=mydb
+DATE=$(date +%Y%m%d)
+
+export PGPASSWORD=mypassword
+
+pg_dump -Fc -U postgres -h localhost "$DB" \
+  -f "$BACKUP_DIR/${DB}_${DATE}.dump"
+
+# Keep only the last 7 days
+find "$BACKUP_DIR" -name "${DB}_*.dump" -mtime +7 -delete
+```

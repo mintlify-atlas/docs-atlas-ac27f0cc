@@ -1,0 +1,251 @@
+---
+title: 'JSON'
+description: 'JSON vs JSONB, operators (->, ->>, #>, #>>), jsonb_set, jsonb_insert, row_to_json, json_build_object, json_each, jsonpath queries, and GIN indexes on JSONB in PostgreSQL.'
+---
+
+PostgreSQL provides two JSON types: `json` (exact text copy) and `jsonb` (decomposed binary). For most applications, prefer `jsonb` because it is faster to process and supports indexing.
+
+## json vs jsonb
+
+```sql
+-- json preserves whitespace and key order
+SELECT '{"bar": "baz", "balance": 7.77, "active":false}'::json;
+-- {"bar": "baz", "balance": 7.77, "active":false}
+
+-- jsonb normalizes: removes whitespace, sorts keys, deduplicates
+SELECT '{"bar": "baz", "balance": 7.77, "active":false}'::jsonb;
+-- {"bar": "baz", "active": false, "balance": 7.77}
+```
+
+| Feature | json | jsonb |
+|---|---|---|
+| Storage | Exact text | Decomposed binary |
+| Processing speed | Slower (reparsed on access) | Faster |
+| Indexing (GIN) | No | Yes |
+| Key order preserved | Yes | No |
+| Duplicate keys | All kept | Last value kept |
+
+<Tip>
+Use `jsonb` unless you have a specific reason to preserve key order or duplicate keys (e.g., interoperating with a system that depends on insertion order).
+</Tip>
+
+## Field access operators
+
+```sql
+SELECT
+    info->'name'           AS name_json,      -- returns jsonb
+    info->>'name'          AS name_text,      -- returns text
+    info->'address'->'city' AS city_json,
+    info->>'email'         AS email_text
+FROM users;
+```
+
+### Path operators for nested access
+
+```sql
+-- #> returns jsonb at the given path
+SELECT info #> '{address, city}' FROM users;
+
+-- #>> returns text at the given path
+SELECT info #>> '{address, city}' FROM users;
+```
+
+| Operator | Right type | Description |
+|---|---|---|
+| `->` | `int` or `text` | Get array element or object field as `jsonb` |
+| `->>` | `int` or `text` | Get array element or object field as `text` |
+| `#>` | `text[]` | Get value at path as `jsonb` |
+| `#>>` | `text[]` | Get value at path as `text` |
+
+## Containment and existence
+
+```sql
+-- Containment: does the left side contain the right side?
+SELECT '{"a": 1, "b": 2}'::jsonb @> '{"a": 1}'::jsonb;  -- true
+
+SELECT '[1, 2, 3]'::jsonb @> '[1, 3]'::jsonb;  -- true (order irrelevant)
+
+-- Existence: does the key exist?
+SELECT '{"a": 1}'::jsonb ? 'a';      -- true
+
+-- Any key exists?
+SELECT '{"a": 1}'::jsonb ?| ARRAY['a', 'b'];  -- true
+
+-- All keys exist?
+SELECT '{"a": 1, "b": 2}'::jsonb ?& ARRAY['a', 'b'];  -- true
+```
+
+## Modifying JSONB
+
+### jsonb_set
+
+Replace or create a field at a given path.
+
+```sql
+-- Set the "status" field
+UPDATE orders
+SET metadata = jsonb_set(metadata, '{status}', '"shipped"')
+WHERE order_id = 1001;
+
+-- Update a nested field; create_missing = true (default) creates it if absent
+UPDATE users
+SET profile = jsonb_set(profile, '{address, zip}', '"90210"', true)
+WHERE user_id = 42;
+```
+
+### jsonb_insert
+
+Insert a value into an array at a given position or add a new object key.
+
+```sql
+-- Insert at index 1 in an array (before existing element at index 1)
+SELECT jsonb_insert('["a", "b", "c"]', '{1}', '"x"');
+-- ["a", "x", "b", "c"]
+
+-- Append to array
+SELECT jsonb_insert('["a", "b"]', '{-1}', '"c"', true);
+-- ["a", "b", "c"]
+```
+
+### Concatenation and deletion operators
+
+```sql
+-- Concatenate / merge two JSONB objects
+SELECT '{"a": 1}'::jsonb || '{"b": 2}'::jsonb;
+-- {"a": 1, "b": 2}
+
+-- Delete a key
+SELECT '{"a": 1, "b": 2}'::jsonb - 'a';
+-- {"b": 2}
+
+-- Delete multiple keys
+SELECT '{"a": 1, "b": 2, "c": 3}'::jsonb - ARRAY['a', 'b'];
+-- {"c": 3}
+
+-- Delete at a path
+SELECT '{"a": {"b": 1, "c": 2}}'::jsonb #- '{a, b}';
+-- {"a": {"c": 2}}
+```
+
+## Building JSON
+
+```sql
+SELECT json_build_object(
+    'id',   product_no,
+    'name', name,
+    'price', price
+)
+FROM products
+WHERE category = 'electronics';
+
+-- Convert a row to JSON
+SELECT row_to_json(p) FROM products p LIMIT 1;
+
+-- Convert result set to JSON array
+SELECT json_agg(p) FROM products p WHERE category = 'electronics';
+
+-- jsonb equivalent
+SELECT jsonb_agg(jsonb_build_object('name', name, 'price', price))
+FROM products;
+```
+
+## Expanding JSON
+
+```sql
+-- json_each returns key-value pairs as rows
+SELECT key, value
+FROM json_each('{"a": 1, "b": 2}');
+
+-- json_each_text returns values as text
+SELECT key, value
+FROM json_each_text('{"a": "hello", "b": "world"}');
+
+-- Expand an array of objects
+SELECT *
+FROM json_to_recordset('[{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]')
+    AS t(name text, age int);
+
+-- Unnest a JSON array
+SELECT value FROM json_array_elements('[1, 2, 3]');
+```
+
+## JSONPath queries
+
+JSONPath (available since PostgreSQL 12) provides a path language for querying and filtering JSONB.
+
+```sql
+-- Basic path extraction
+SELECT jsonb_path_query(
+    '{"store": {"books": [{"price": 8.95}, {"price": 12.99}]}}',
+    '$.store.books[*].price'
+);
+
+-- Filter: books cheaper than 10
+SELECT jsonb_path_query(
+    '{"store": {"books": [{"title": "A", "price": 8.95}, {"title": "B", "price": 12.99}]}}',
+    '$.store.books[*] ? (@.price < 10)'
+);
+
+-- Check if path matches
+SELECT jsonb_path_exists(
+    '{"tags": ["postgresql", "database"]}',
+    '$.tags[*] ? (@ == "postgresql")'
+);  -- true
+
+-- Extract first match
+SELECT jsonb_path_query_first(
+    '[{"a": 1}, {"a": 2}]',
+    '$[*].a'
+);  -- 1
+```
+
+## GIN indexes on JSONB
+
+```sql
+-- Default GIN index: supports @>, ?, ?|, ?&
+CREATE INDEX idx_products_attrs ON products USING GIN (attributes);
+
+-- jsonb_path_ops GIN: smaller, only supports @>, @@, @?
+CREATE INDEX idx_products_attrs_path ON products
+    USING GIN (attributes jsonb_path_ops);
+
+-- Query using the GIN index
+SELECT * FROM products WHERE attributes @> '{"color": "red"}';
+SELECT * FROM products WHERE attributes ? 'color';
+```
+
+<Note>
+`jsonb_path_ops` produces a smaller index but only supports the containment operator `@>` and JSONPath operators `@@` and `@?`. Use the default `jsonb_ops` operator class if you need `?`, `?|`, or `?&`.
+</Note>
+
+## Practical example: product catalog
+
+```sql
+CREATE TABLE products (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       text NOT NULL,
+    attributes jsonb
+);
+
+CREATE INDEX idx_products_attrs ON products USING GIN (attributes);
+
+INSERT INTO products (name, attributes) VALUES
+    ('Widget A', '{"color": "red",  "size": "M", "tags": ["sale"]}'),
+    ('Widget B', '{"color": "blue", "size": "L", "tags": ["new", "sale"]}'),
+    ('Gadget',   '{"color": "red",  "weight": 0.5, "tags": ["premium"]}');
+
+-- Find red products on sale
+SELECT name, attributes->>'color', attributes->>'size'
+FROM products
+WHERE attributes @> '{"color": "red", "tags": ["sale"]}';
+
+-- Update a field
+UPDATE products
+SET attributes = jsonb_set(attributes, '{size}', '"XL"')
+WHERE name = 'Widget B';
+
+-- Remove a key
+UPDATE products
+SET attributes = attributes - 'weight'
+WHERE name = 'Gadget';
+```

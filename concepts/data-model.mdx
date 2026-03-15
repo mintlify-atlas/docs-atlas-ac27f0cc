@@ -1,0 +1,247 @@
+---
+title: "Data model"
+description: "Tables, rows, columns, schemas, databases, tablespaces, OIDs, system catalogs, and PostgreSQL's table inheritance model."
+---
+
+PostgreSQL uses a hierarchical data model: a running server instance manages one or more **databases**, each database contains one or more **schemas**, and each schema contains **tables**, **views**, **indexes**, **sequences**, **functions**, and other named objects.
+
+## Databases and clusters
+
+A **database cluster** is a collection of databases managed by a single PostgreSQL server instance. In file-system terms, a cluster is a single directory (the *data directory* or `PGDATA`) that holds all data for all databases.
+
+When `initdb` initializes a new cluster, it creates three databases:
+
+| Database | Purpose |
+|---|---|
+| `postgres` | Default database for users, utilities, and third-party applications. The server does not require it to exist, but many tools assume it does. |
+| `template1` | Template used when `CREATE DATABASE` is issued with no `TEMPLATE` clause. Objects in `template1` are copied into every new database. |
+| `template0` | A pristine copy of the initial system catalog contents. Use it when you need a database with no local modifications, or when restoring a dump with a different encoding. |
+
+<Note>
+  Do not use `template0` for regular work. `CREATE DATABASE mydb TEMPLATE template0` is the correct way to create a database with a non-default locale or encoding.
+</Note>
+
+Databases are completely isolated from each other at the SQL level. A connection is always to a specific database; you cannot query tables in another database in the same statement (without a foreign data wrapper or `dblink`).
+
+## Schemas
+
+A **schema** is a namespace within a database. Every table, view, index, and function belongs to exactly one schema. The default schema for objects created without an explicit schema name is `public`.
+
+Built-in schemas:
+
+| Schema | Contents |
+|---|---|
+| `public` | Default schema for user objects |
+| `pg_catalog` | System catalogs and built-in data types |
+| `information_schema` | SQL-standard views of catalog data |
+| `pg_toast` | TOAST storage tables (managed automatically) |
+| `pg_temp_N` | Temporary tables for session N |
+
+```sql
+-- Create a schema
+CREATE SCHEMA finance;
+
+-- Create a table in that schema
+CREATE TABLE finance.invoices (
+    id          bigserial PRIMARY KEY,
+    amount      numeric(12, 2) NOT NULL,
+    issued_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- The search_path controls which schemas are searched for unqualified names
+SET search_path = finance, public;
+SELECT * FROM invoices;  -- resolves to finance.invoices
+```
+
+## Tables
+
+A **table** (also called a *relation* or *heap*) stores rows of a fixed set of typed columns. PostgreSQL tables are stored as a sequence of 8 kB pages (the default block size `BLCKSZ`) in the file system.
+
+```sql
+CREATE TABLE orders (
+    id          bigserial       PRIMARY KEY,
+    customer_id integer         NOT NULL REFERENCES customers(id),
+    status      text            NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending', 'shipped', 'delivered', 'cancelled')),
+    total       numeric(12, 2)  NOT NULL CHECK (total >= 0),
+    created_at  timestamptz     NOT NULL DEFAULT now()
+);
+```
+
+### Rows (tuples)
+
+In PostgreSQL source code, a row is called a **tuple** and is represented by the `HeapTuple` structure. Each physical tuple on a heap page contains:
+
+- **`t_xmin`** — the transaction ID that inserted this tuple
+- **`t_xmax`** — the transaction ID that deleted or updated this tuple (0 if still live)
+- **`t_ctid`** — the physical location (page, offset) of this or a newer version
+- **`t_cid`** — command counter within the inserting transaction
+- **Null bitmap** — one bit per nullable column
+- **Column data** — the actual attribute values
+
+These system fields are the foundation of PostgreSQL's MVCC implementation. See [MVCC](/concepts/mvcc) for details.
+
+### System columns
+
+Every table has hidden system columns you can query explicitly:
+
+```sql
+SELECT ctid, xmin, xmax, tableoid, * FROM orders LIMIT 5;
+```
+
+| Column | Type | Meaning |
+|---|---|---|
+| `ctid` | `tid` | Physical location of the row: `(page, offset)` |
+| `xmin` | `xid` | Transaction ID that created this row version |
+| `xmax` | `xid` | Transaction ID that deleted or updated this row (0 if live) |
+| `tableoid` | `oid` | OID of the table (useful with inheritance) |
+
+## Columns and data types
+
+PostgreSQL supports a rich set of built-in types and allows user-defined types.
+
+<AccordionGroup>
+  <Accordion title="Numeric types">
+    | Type | Storage | Range / precision |
+    |---|---|---|
+    | `smallint` | 2 bytes | −32768 to 32767 |
+    | `integer` | 4 bytes | −2147483648 to 2147483647 |
+    | `bigint` | 8 bytes | −9223372036854775808 to 9223372036854775807 |
+    | `numeric(p, s)` | variable | Up to 131072 digits before the decimal point, 16383 after |
+    | `real` | 4 bytes | 6 decimal digits precision |
+    | `double precision` | 8 bytes | 15 decimal digits precision |
+    | `smallserial` / `serial` / `bigserial` | 2/4/8 bytes | Auto-incrementing integer (backed by a sequence) |
+  </Accordion>
+  <Accordion title="Character types">
+    | Type | Description |
+    |---|---|
+    | `char(n)` | Fixed-length, blank-padded |
+    | `varchar(n)` | Variable-length with limit |
+    | `text` | Variable-length, unlimited |
+  </Accordion>
+  <Accordion title="Date/time types">
+    | Type | Storage | Description |
+    |---|---|---|
+    | `date` | 4 bytes | Calendar date only |
+    | `time` | 8 bytes | Time of day (no timezone) |
+    | `timetz` | 12 bytes | Time of day with timezone offset |
+    | `timestamp` | 8 bytes | Date and time (no timezone) |
+    | `timestamptz` | 8 bytes | Date and time, stored as UTC |
+    | `interval` | 16 bytes | Time span |
+  </Accordion>
+  <Accordion title="Other commonly used types">
+    | Type | Description |
+    |---|---|
+    | `boolean` | `true` / `false` / `null` |
+    | `bytea` | Binary data |
+    | `json` / `jsonb` | JSON data (`jsonb` is binary-parsed and indexable) |
+    | `uuid` | 128-bit universally unique identifier |
+    | `inet` / `cidr` | IPv4 and IPv6 host addresses and networks |
+    | `point`, `line`, `polygon` | Geometric types |
+    | `tsvector` / `tsquery` | Full-text search types |
+    | `int[]`, `text[]` | Arrays of any base type |
+    | `hstore` | Key-value store (extension) |
+  </Accordion>
+</AccordionGroup>
+
+## OIDs
+
+Almost every object in PostgreSQL — tables, indexes, functions, types, operators — has an **OID** (Object Identifier), a 4-byte unsigned integer assigned when the object is created. OIDs serve as the internal primary keys for the system catalogs.
+
+```sql
+-- Find the OID of a table
+SELECT oid, relname FROM pg_class WHERE relname = 'orders';
+
+-- The tableoid system column identifies which table a row belongs to
+SELECT tableoid::regclass, count(*) FROM orders GROUP BY tableoid;
+```
+
+<Note>
+  OIDs used to be visible as a system column in every user table (before PostgreSQL 12). They are now only present in system catalog tables. User tables store row identity through their primary keys.
+</Note>
+
+## System catalogs
+
+PostgreSQL stores all metadata about the database in a set of tables called **system catalogs**, all stored in the `pg_catalog` schema.
+
+| Catalog | Contents |
+|---|---|
+| `pg_class` | Tables, indexes, sequences, views, and other "relations" |
+| `pg_attribute` | Column definitions for every relation |
+| `pg_type` | Data types |
+| `pg_proc` | Functions and procedures |
+| `pg_namespace` | Schemas |
+| `pg_index` | Index metadata |
+| `pg_constraint` | Table constraints (PRIMARY KEY, FOREIGN KEY, CHECK, UNIQUE) |
+| `pg_depend` | Dependency relationships between objects |
+| `pg_database` | Databases in this cluster |
+| `pg_tablespace` | Tablespaces |
+| `pg_roles` | Database roles (users and groups) |
+| `pg_statistic` | Column statistics collected by `ANALYZE` |
+| `pg_locks` | Currently held and awaited locks |
+
+```sql
+-- Inspect columns of the orders table via the system catalog
+SELECT attname, atttypid::regtype, attnotnull, atthasdef
+FROM pg_attribute
+WHERE attrelid = 'orders'::regclass
+  AND attnum > 0
+ORDER BY attnum;
+```
+
+## Tablespaces
+
+A **tablespace** is a named location on the file system where PostgreSQL stores database files. The two built-in tablespaces are:
+
+| Tablespace | Location | Purpose |
+|---|---|---|
+| `pg_default` | `$PGDATA/base` | Default tablespace for user objects |
+| `pg_global` | `$PGDATA/global` | Cluster-wide catalog tables |
+
+You can create additional tablespaces to store tables or indexes on different file systems (e.g., on a faster SSD for frequently accessed indexes):
+
+```sql
+CREATE TABLESPACE fast_disk LOCATION '/mnt/ssd/pgdata';
+
+CREATE TABLE hot_data (
+    id bigserial PRIMARY KEY,
+    payload jsonb
+) TABLESPACE fast_disk;
+
+CREATE INDEX ON hot_data(id) TABLESPACE fast_disk;
+```
+
+## Table inheritance
+
+PostgreSQL supports single-table inheritance as an object-relational feature. A child table inherits all columns of its parent.
+
+```sql
+CREATE TABLE vehicles (
+    id          bigserial PRIMARY KEY,
+    make        text NOT NULL,
+    model       text NOT NULL,
+    year        int  NOT NULL
+);
+
+CREATE TABLE cars (
+    num_doors   int NOT NULL
+) INHERITS (vehicles);
+
+CREATE TABLE trucks (
+    payload_kg  numeric NOT NULL
+) INHERITS (vehicles);
+
+-- INSERT into child tables
+INSERT INTO cars (make, model, year, num_doors)
+VALUES ('Toyota', 'Corolla', 2023, 4);
+
+-- Query the parent to see rows from all children
+SELECT * FROM vehicles;        -- includes cars and trucks
+SELECT * FROM ONLY vehicles;   -- only rows directly in vehicles
+```
+
+Inheritance is most commonly used with **declarative partitioning** (PostgreSQL 10+), which uses the same inheritance mechanism internally but provides a more ergonomic interface for range, list, and hash partitioning strategies.
+
+<Note>
+  Table inheritance does not propagate unique constraints, primary keys, or foreign keys to child tables. For most partitioning use cases, **declarative partitioning** (`PARTITION BY RANGE / LIST / HASH`) is preferred over manual inheritance.
+</Note>

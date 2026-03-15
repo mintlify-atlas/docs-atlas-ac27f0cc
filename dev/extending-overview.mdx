@@ -1,0 +1,187 @@
+---
+title: Extending PostgreSQL
+description: Overview of PostgreSQL's extensibility model. Learn how to package extensions with control files and SQL scripts, and what can be extended — types, functions, operators, index methods, FDWs, and more.
+---
+
+PostgreSQL is extensible because its operation is catalog-driven. Where conventional databases store information about tables and columns in a hard-coded data dictionary, PostgreSQL stores much more: data types, functions, operators, index access methods, foreign data wrappers, and so on. Because these are just rows in regular tables, users can add new entries and PostgreSQL's query engine uses them automatically.
+
+The server can also load user-written shared libraries on demand, allowing new types, functions, and operators to be written in C without modifying the server source code.
+
+## What you can extend
+
+<CardGroup cols={2}>
+  <Card title="Functions" icon="function" href="/dev/custom-functions">
+    SQL functions, C-language functions, set-returning functions, and aggregate functions.
+  </Card>
+  <Card title="Data types" icon="shapes" href="/dev/custom-types">
+    Base types with C I/O functions, composite types, domain types, and enum types.
+  </Card>
+  <Card title="Operators" icon="plus" href="/dev/custom-operators">
+    Infix and prefix operators with optimizer hints (commutator, negator, restrict, join).
+  </Card>
+  <Card title="Index methods" icon="magnifying-glass" href="/dev/custom-indexes">
+    Custom index access methods via `IndexAmRoutine`, operator classes, and operator families.
+  </Card>
+  <Card title="Foreign data wrappers" icon="plug" href="/dev/fdw">
+    Connect to external data sources with a full FDW implementing `FdwRoutine`.
+  </Card>
+  <Card title="Procedural languages" icon="code">
+    Register new procedural languages with a call handler and optional validator.
+  </Card>
+</CardGroup>
+
+Additional extension points include:
+
+- **Background workers** — long-running server processes via `BackgroundWorker`
+- **Custom WAL resource managers** — custom write-ahead log record types
+- **Table access methods** — alternate storage engines via `TableAmRoutine`
+- **Aggregate functions** — `CREATE AGGREGATE` with state transition and finalize functions
+- **Statistics objects** — `CREATE STATISTICS` for planner improvements
+- **Event triggers** — fire on DDL events via `CREATE EVENT TRIGGER`
+
+## The extension infrastructure
+
+PostgreSQL's extension system lets you package a collection of related objects (functions, types, operators, tables, etc.) so they can be installed and removed atomically.
+
+```sql
+CREATE EXTENSION extension_name;
+DROP EXTENSION extension_name CASCADE;
+ALTER EXTENSION extension_name UPDATE TO '2.0';
+```
+
+Advantages over running loose SQL scripts:
+
+- `DROP EXTENSION` removes all member objects in one command.
+- `pg_dump` emits a single `CREATE EXTENSION` command instead of dumping every member object individually.
+- Version upgrade scripts can be provided and applied with `ALTER EXTENSION ... UPDATE`.
+- PostgreSQL prevents dropping individual member objects accidentally.
+
+### Extension files
+
+An extension requires at minimum two files, both placed in `$SHAREDIR/extension/` (find it with `pg_config --sharedir`):
+
+```
+extension_name.control
+extension_name--1.0.sql
+```
+
+**Control file** (`myext.control`):
+
+```ini
+# myext.control
+default_version = '1.0'
+module_pathname = '$libdir/myext'
+comment = 'My example extension'
+relocatable = true
+```
+
+Key control file parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `default_version` | Version installed when `CREATE EXTENSION` omits `VERSION` |
+| `module_pathname` | Substituted for `MODULE_PATHNAME` in the SQL script; typically `$libdir/myext` |
+| `requires` | Comma-separated list of prerequisite extensions |
+| `superuser` | `true` (default) — only superusers can install; `false` — anyone with `CREATE` on the database |
+| `trusted` | `true` — users with `CREATE` on the database can install even if `superuser = true` |
+| `relocatable` | `true` if all objects can be moved to a different schema |
+| `schema` | Locks the extension into a specific schema |
+| `comment` | Human-readable description |
+
+**SQL script** (`myext--1.0.sql`):
+
+```sql
+-- myext--1.0.sql
+
+-- Required guard
+\echo Use "CREATE EXTENSION myext" to load this file. \quit
+
+CREATE FUNCTION myext_add(integer, integer)
+    RETURNS integer
+    AS 'MODULE_PATHNAME', 'myext_add'
+    LANGUAGE C STRICT IMMUTABLE;
+```
+
+**Update script** (`myext--1.0--2.0.sql`):
+
+```sql
+-- myext--1.0--2.0.sql
+\echo Use "ALTER EXTENSION myext UPDATE TO '2.0'" to load this file. \quit
+
+ALTER FUNCTION myext_add(integer, integer) SECURITY DEFINER;
+
+CREATE FUNCTION myext_mul(integer, integer)
+    RETURNS integer
+    AS 'MODULE_PATHNAME', 'myext_mul'
+    LANGUAGE C STRICT IMMUTABLE;
+```
+
+### Shared library
+
+If the extension includes C code, compile it into a shared library. The library must include `PG_MODULE_MAGIC` (or `PG_MODULE_MAGIC_EXT`) in exactly one source file:
+
+```c
+#include "postgres.h"
+#include "fmgr.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(myext_add);
+
+Datum
+myext_add(PG_FUNCTION_ARGS)
+{
+    int32 a = PG_GETARG_INT32(0);
+    int32 b = PG_GETARG_INT32(1);
+    PG_RETURN_INT32(a + b);
+}
+```
+
+Compile using `pg_config` variables:
+
+```bash
+cc -shared -fPIC -o myext.so myext.c \
+    $(pg_config --cflags) \
+    -I$(pg_config --includedir-server)
+
+cp myext.so $(pg_config --pkglibdir)/
+```
+
+Or use `PGXS` in a Makefile:
+
+```makefile
+MODULE_big = myext
+OBJS       = myext.o
+EXTENSION  = myext
+DATA       = myext--1.0.sql
+
+PG_CONFIG  = pg_config
+PGXS      := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+```
+
+Then:
+
+```bash
+make
+make install
+psql -c "CREATE EXTENSION myext"
+```
+
+## Version compatibility
+
+PostgreSQL makes no promise of API compatibility across major versions. Extensions typically need small source changes for each major release. Use preprocessor guards:
+
+```c
+#if PG_VERSION_NUM >= 160000
+    /* PG 16+ code */
+#else
+    /* older code */
+#endif
+```
+
+The `PG_MODULE_MAGIC` macro encodes version information, so a shared library compiled for one major version will be rejected by a different major version at load time.
+
+<Note>
+ABI compatibility is generally maintained across minor releases of the same major version, so you do not normally need to recompile extensions for minor-version upgrades.
+</Note>

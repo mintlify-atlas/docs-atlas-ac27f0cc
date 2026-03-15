@@ -1,0 +1,260 @@
+---
+title: Backup and restore
+description: Back up PostgreSQL databases with pg_dump and pg_dumpall for logical backups, use pg_basebackup for physical backups, configure continuous WAL archiving, and verify restores.
+---
+
+Three fundamentally different backup strategies exist for PostgreSQL:
+
+<CardGroup cols={3}>
+  <Card title="SQL dump" icon="file-code">
+    Logical backup using `pg_dump` or `pg_dumpall`. Portable across versions and architectures.
+  </Card>
+  <Card title="Physical backup" icon="hard-drive">
+    File-level copy of the data directory using `pg_basebackup`. Fast for large databases.
+  </Card>
+  <Card title="Continuous archiving" icon="clock">
+    Combines a base backup with ongoing WAL archiving. Enables point-in-time recovery.
+  </Card>
+</CardGroup>
+
+## SQL dump with pg_dump
+
+`pg_dump` generates SQL commands that recreate the database in its state at dump time. It does not block concurrent operations (except those requiring exclusive locks like most `ALTER TABLE` forms).
+
+### Basic dump and restore
+
+```bash
+# Dump to a plain SQL file
+pg_dump mydb > mydb.sql
+
+# Restore into a new database
+createdb -T template0 mydb_restore
+psql -X -f mydb.sql mydb_restore
+```
+
+<Note>
+  Create the target database from `template0`, not `template1`, to avoid conflicts with custom objects added to `template1`.
+</Note>
+
+### Dump formats
+
+`pg_dump` supports four output formats:
+
+<Tabs>
+  <Tab title="Plain SQL">
+    ```bash
+    pg_dump mydb > mydb.sql
+    # Restore:
+    psql -X mydb_restore < mydb.sql
+    ```
+    Text file, readable and editable. Restore with `psql`.
+  </Tab>
+  <Tab title="Custom format">
+    ```bash
+    pg_dump -Fc mydb > mydb.dump
+    # Restore:
+    pg_restore -d mydb_restore mydb.dump
+    # Selective restore:
+    pg_restore -d mydb_restore -t orders mydb.dump
+    ```
+    Compressed, supports parallel and selective restore. Requires `pg_restore`.
+  </Tab>
+  <Tab title="Directory format">
+    ```bash
+    pg_dump -Fd mydb -f mydb_dir/
+    # Parallel dump (4 jobs):
+    pg_dump -Fd -j 4 mydb -f mydb_dir/
+    # Restore:
+    pg_restore -d mydb_restore mydb_dir/
+    ```
+    One file per table. Supports parallel dump and restore.
+  </Tab>
+  <Tab title="Tar format">
+    ```bash
+    pg_dump -Ft mydb > mydb.tar
+    pg_restore -d mydb_restore mydb.tar
+    ```
+    Single tar archive. Does not support compression natively.
+  </Tab>
+</Tabs>
+
+### Parallel restore
+
+```bash
+pg_restore -d mydb_restore -j 4 mydb.dump
+```
+
+Parallel restore works with custom (`-Fc`) and directory (`-Fd`) formats.
+
+### Common pg_dump options
+
+| Option | Description |
+|--------|-------------|
+| `-h host` | Server hostname |
+| `-p port` | Server port |
+| `-U user` | Connect as this user |
+| `-n schema` | Dump only this schema |
+| `-t table` | Dump only this table |
+| `--no-owner` | Do not output commands to set object ownership |
+| `--no-privileges` | Do not dump `GRANT`/`REVOKE` commands |
+| `--if-exists` | Use `DROP ... IF EXISTS` in output |
+| `--compress=level` | Compression level (0–9) for custom format |
+
+### Dump to/from a remote server via pipe
+
+```bash
+pg_dump -h source_host mydb | psql -X -h target_host mydb
+```
+
+### Error handling during restore
+
+By default, `psql` continues on SQL errors. To stop on first error:
+
+```bash
+psql -X --set ON_ERROR_STOP=on mydb_restore < mydb.sql
+```
+
+For an all-or-nothing restore (single transaction):
+
+```bash
+psql -X --single-transaction mydb_restore < mydb.sql
+```
+
+## Cluster-wide backup with pg_dumpall
+
+`pg_dump` dumps a single database and omits cluster-wide objects (roles, tablespaces). Use `pg_dumpall` for a complete cluster backup:
+
+```bash
+# Full cluster backup
+pg_dumpall > cluster.sql
+
+# Restore (requires superuser)
+psql -X -f cluster.sql postgres
+```
+
+Dump only globals (roles and tablespaces), without database data:
+
+```bash
+pg_dumpall --globals-only > globals.sql
+```
+
+<Warning>
+  `pg_dumpall` does not produce synchronized snapshots across databases. Each database is dumped independently, so inter-database consistency is not guaranteed.
+</Warning>
+
+## Physical backup with pg_basebackup
+
+`pg_basebackup` creates a binary copy of the entire cluster data directory while the server is running. It is suitable for seeding standby servers and for PITR base backups.
+
+### Prerequisites on the primary
+
+```ini postgresql.conf
+wal_level = replica      # or logical
+max_wal_senders = 3      # allow at least one replication connection
+```
+
+```conf pg_hba.conf
+host  replication  replicator  192.168.1.100/32  scram-sha-256
+```
+
+```sql
+CREATE ROLE replicator REPLICATION LOGIN PASSWORD 'replpass';
+```
+
+### Running pg_basebackup
+
+```bash
+# Plain backup to a directory
+pg_basebackup -h primary_host -U replicator \
+  -D /var/lib/pgsql/backup \
+  -P --wal-method=stream
+
+# Compressed tar archives
+pg_basebackup -h primary_host -U replicator \
+  -D /var/lib/pgsql/backup \
+  -Ft -z -P --wal-method=stream
+```
+
+| Option | Description |
+|--------|-------------|
+| `-D dir` | Destination directory |
+| `-Ft` | Tar format (one file per tablespace) |
+| `-z` | Compress output |
+| `-P` | Show progress |
+| `--wal-method=stream` | Stream WAL during backup (recommended) |
+| `--wal-method=fetch` | Fetch WAL at end of backup |
+| `-R` | Write `standby.signal` and `primary_conninfo` for use as a standby |
+| `-S slot` | Use a named replication slot |
+
+<Tip>
+  Use `--wal-method=stream` to include WAL generated during the backup in the output, making the backup self-contained without needing an archive.
+</Tip>
+
+## Continuous WAL archiving
+
+Continuous archiving copies completed WAL segment files (16 MB each by default) to an archive location. Combined with a base backup, this enables point-in-time recovery.
+
+### Configuring archiving
+
+```ini postgresql.conf
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /mnt/archive/%f && cp %p /mnt/archive/%f'
+```
+
+In `archive_command`:
+- `%p` is replaced by the full path to the WAL segment file.
+- `%f` is replaced by the file name only.
+- The command must return exit code 0 on success.
+
+<Warning>
+  The archive command must **not** overwrite existing files. The example above uses `test ! -f` to check for pre-existing files before copying. This protects archive integrity.
+</Warning>
+
+Verify archiving is working:
+
+```sql
+SELECT archived_count, last_archived_wal, last_archived_time,
+       failed_count, last_failed_wal, last_failed_time
+FROM pg_stat_archiver;
+```
+
+## Backup verification
+
+After taking a backup, verify it by performing a test restore:
+
+<Steps>
+  <Step title="Restore into an isolated environment">
+    Restore to a separate host or directory — never restore a test backup over a live cluster.
+  </Step>
+  <Step title="Start the server and check logs">
+    ```bash
+    pg_ctl start -D /var/lib/pgsql/test_restore -l /tmp/restore.log
+    ```
+    Look for errors in the log. The server should reach "ready to accept connections".
+  </Step>
+  <Step title="Run ANALYZE and consistency checks">
+    ```sql
+    -- Update planner statistics after restore
+    ANALYZE;
+
+    -- Check for catalog corruption (requires the amcheck extension)
+    CREATE EXTENSION IF NOT EXISTS amcheck;
+    SELECT bt_index_check(oid) FROM pg_class WHERE relkind = 'i' AND relam = 403;
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  After restoring an SQL dump, run `ANALYZE` on all databases. The optimizer statistics are not included in `pg_dump` output and the planner will make poor choices without them.
+</Note>
+
+## Backup retention and scheduling
+
+A typical backup strategy combines all three methods:
+
+1. **Daily `pg_dumpall`** for a portable logical backup of globals and all databases.
+2. **Weekly `pg_basebackup`** as the base for continuous archiving.
+3. **Continuous WAL archiving** to enable PITR between base backups.
+
+Retain enough WAL archives to cover your recovery point objective (RPO). For example, to recover to any point in the past 7 days, keep 7 days of WAL archives plus the most recent base backup.

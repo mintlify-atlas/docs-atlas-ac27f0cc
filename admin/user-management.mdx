@@ -1,0 +1,261 @@
+---
+title: User management
+description: Create and manage PostgreSQL roles and users, grant and revoke privileges on database objects, use role inheritance, and implement row-level security policies.
+---
+
+PostgreSQL manages access using **roles**. A role can represent a user (with `LOGIN` privilege), a group, or both. The concepts of "user" and "group" from earlier PostgreSQL versions are now unified — every principal is a role.
+
+Roles are global across a cluster: they are not database-specific.
+
+## Creating roles
+
+```sql
+-- Create a role without login (a group role)
+CREATE ROLE readonly;
+
+-- Create a login-capable user with a password
+CREATE ROLE alice LOGIN PASSWORD 'securepassword';
+
+-- CREATE USER is equivalent to CREATE ROLE ... LOGIN
+CREATE USER bob PASSWORD 'anotherpassword';
+
+-- Drop a role
+DROP ROLE alice;
+```
+
+### Role attributes
+
+| Attribute | Keyword | Description |
+|-----------|---------|-------------|
+| Login | `LOGIN` / `NOLOGIN` | Whether the role can initiate a database connection |
+| Superuser | `SUPERUSER` / `NOSUPERUSER` | Bypasses all permission checks except login |
+| Create databases | `CREATEDB` / `NOCREATEDB` | Can create new databases |
+| Create roles | `CREATEROLE` / `NOCREATEROLE` | Can create, alter, and drop roles (within limits) |
+| Replication | `REPLICATION` / `NOREPLICATION` | Can initiate streaming replication |
+| Bypass RLS | `BYPASSRLS` / `NOBYPASSRLS` | Bypasses row-level security policies |
+| Connection limit | `CONNECTION LIMIT n` | Max concurrent connections (`-1` = unlimited) |
+| Inherit | `INHERIT` / `NOINHERIT` | Whether to inherit privileges of member roles |
+
+```sql
+-- Create a superuser (requires existing superuser to run this)
+CREATE ROLE admin SUPERUSER LOGIN PASSWORD 'adminpass';
+
+-- Create a role that can create databases but not manage roles
+CREATE ROLE developer CREATEDB LOGIN PASSWORD 'devpass';
+
+-- Create a replication user
+CREATE ROLE replicator REPLICATION LOGIN PASSWORD 'replpass';
+
+-- Limit a role to 10 simultaneous connections
+CREATE ROLE webuser LOGIN PASSWORD 'webpass' CONNECTION LIMIT 10;
+
+-- Alter an existing role
+ALTER ROLE bob CONNECTION LIMIT 5;
+ALTER ROLE bob PASSWORD 'newpassword';
+```
+
+<Warning>
+  Superuser status bypasses all permission checks except the right to log in. Grant `SUPERUSER` only to trusted administrative accounts. Do day-to-day work as a non-superuser role.
+</Warning>
+
+## Role membership and inheritance
+
+You can grant one role's membership to another, creating group roles.
+
+```sql
+-- Create a group role
+CREATE ROLE reporting;
+
+-- Add users to the group
+GRANT reporting TO alice;
+GRANT reporting TO bob;
+
+-- Alice and Bob now inherit privileges of the reporting role
+-- (because INHERIT is the default)
+```
+
+To grant membership without privilege inheritance:
+
+```sql
+GRANT reporting TO alice WITH INHERIT FALSE;
+-- Alice must explicitly SET ROLE reporting to use those privileges:
+SET ROLE reporting;
+```
+
+To grant with admin option (the grantee can then grant the role to others):
+
+```sql
+GRANT reporting TO alice WITH ADMIN OPTION;
+```
+
+## Viewing roles
+
+```sql
+-- All roles
+SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolcanlogin, rolreplication
+FROM pg_roles;
+
+-- Login-capable users
+SELECT rolname FROM pg_roles WHERE rolcanlogin;
+
+-- Simplified view (excludes system roles)
+SELECT usename, usecreatedb, usesuper, userepl FROM pg_user;
+
+-- Role memberships
+SELECT r.rolname AS role, m.rolname AS member
+FROM pg_auth_members am
+JOIN pg_roles r ON r.oid = am.roleid
+JOIN pg_roles m ON m.oid = am.member;
+```
+
+In `psql`, use `\du` to list roles and `\du+ rolename` for details.
+
+## Granting privileges on objects
+
+### Databases
+
+```sql
+-- Connect privilege
+GRANT CONNECT ON DATABASE mydb TO alice;
+
+-- Create objects in the database
+GRANT CREATE ON DATABASE mydb TO developer;
+```
+
+### Schemas
+
+```sql
+-- Allow usage (required to access objects in the schema)
+GRANT USAGE ON SCHEMA public TO alice;
+
+-- Allow creating objects in the schema
+GRANT CREATE ON SCHEMA public TO developer;
+```
+
+### Tables
+
+```sql
+-- Read-only access
+GRANT SELECT ON TABLE orders TO alice;
+
+-- Multiple privileges
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE orders TO bob;
+
+-- All privileges
+GRANT ALL PRIVILEGES ON TABLE orders TO admin;
+
+-- Grant on all current tables in a schema
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+
+-- Grant on future tables (alter default privileges)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO readonly;
+```
+
+### Sequences
+
+```sql
+GRANT USAGE, SELECT ON SEQUENCE orders_id_seq TO bob;
+```
+
+### Functions
+
+```sql
+GRANT EXECUTE ON FUNCTION calculate_tax(numeric) TO alice;
+```
+
+### Revoking privileges
+
+```sql
+REVOKE SELECT ON TABLE orders FROM alice;
+REVOKE ALL PRIVILEGES ON TABLE orders FROM bob;
+
+-- Also removes privileges granted by this role to others
+REVOKE SELECT ON TABLE orders FROM alice CASCADE;
+```
+
+## Object ownership
+
+Owners have full control over their objects. Transfer ownership with:
+
+```sql
+ALTER TABLE orders OWNER TO new_owner;
+ALTER DATABASE mydb OWNER TO new_owner;
+ALTER SCHEMA app OWNER TO new_owner;
+```
+
+To reassign all objects owned by a role before dropping it:
+
+```sql
+REASSIGN OWNED BY old_role TO new_owner;
+DROP OWNED BY old_role;  -- drops any remaining privileges
+DROP ROLE old_role;
+```
+
+## Row-level security (RLS)
+
+Row-level security lets you restrict which rows a role can see or modify, enforcing access control at the row level inside the database rather than the application.
+
+<Steps>
+  <Step title="Enable RLS on a table">
+    ```sql
+    ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+    ```
+
+    By default, once RLS is enabled, no rows are visible to non-owners until at least one policy is defined.
+  </Step>
+
+  <Step title="Create policies">
+    ```sql
+    -- Users can only see their own orders
+    CREATE POLICY user_orders_policy
+      ON orders
+      FOR ALL
+      TO webuser
+      USING (user_id = current_user_id());
+
+    -- Separate read and write policies
+    CREATE POLICY orders_read
+      ON orders
+      FOR SELECT
+      USING (user_id = (SELECT id FROM users WHERE username = current_user));
+
+    CREATE POLICY orders_insert
+      ON orders
+      FOR INSERT
+      WITH CHECK (user_id = (SELECT id FROM users WHERE username = current_user));
+    ```
+  </Step>
+
+  <Step title="Grant BYPASSRLS for admin roles">
+    ```sql
+    -- Superusers bypass RLS by default.
+    -- For non-superuser admins:
+    ALTER ROLE admin BYPASSRLS;
+    ```
+  </Step>
+</Steps>
+
+Inspect existing policies:
+
+```sql
+SELECT schemaname, tablename, policyname, roles, cmd, qual, with_check
+FROM pg_policies
+WHERE tablename = 'orders';
+```
+
+<Note>
+  Table owners bypass RLS unless `ALTER TABLE orders FORCE ROW LEVEL SECURITY` is set. Use `FORCE ROW LEVEL SECURITY` when the table owner is also an application role.
+</Note>
+
+## Default privileges for new databases
+
+The `PUBLIC` pseudo-role has `CONNECT` on all databases and `USAGE`, `CREATE` on the `public` schema by default. Restrict this in security-sensitive environments:
+
+```sql
+-- Remove public access to the public schema
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+
+-- Remove default connect privilege (per-database)
+REVOKE CONNECT ON DATABASE mydb FROM PUBLIC;
+```

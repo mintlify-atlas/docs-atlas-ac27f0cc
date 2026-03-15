@@ -1,0 +1,232 @@
+---
+title: pgbench
+description: Benchmark PostgreSQL with the built-in TPC-B-like workload or custom SQL scripts.
+---
+
+`pgbench` is a benchmarking tool for PostgreSQL. It runs SQL scripts against a database using multiple clients and threads, then reports transactions per second (TPS) and latency statistics.
+
+## Initialization
+
+Before running a benchmark you must initialize the `pgbench` tables:
+
+```bash
+# Initialize with default scale factor (1 = 100,000 rows in pgbench_accounts)
+pgbench -i -U postgres mydb
+
+# Scale factor 10 = 1,000,000 rows
+pgbench -i -s 10 -U postgres mydb
+
+# Scale factor 100 for a more realistic workload
+pgbench -i -s 100 -U postgres mydb
+```
+
+Initialization creates four tables:
+- `pgbench_branches` (1 row × scale)
+- `pgbench_tellers` (10 rows × scale)
+- `pgbench_accounts` (100,000 rows × scale)
+- `pgbench_history` (empty)
+
+| Flag | Description |
+|------|-------------|
+| `-i` / `--initialize` | Initialize pgbench tables |
+| `-s SCALE` / `--scale` | Scale factor (default: 1) |
+| `--unlogged-tables` | Use unlogged tables (faster init, no durability) |
+| `--partitions=NUM` | Partition `pgbench_accounts` into NUM partitions |
+| `--tablespace=TBLSPC` | Create tables in this tablespace |
+
+## Running a benchmark
+
+```bash
+# 10 clients, 2 threads, run for 60 seconds
+pgbench -c 10 -j 2 -T 60 -U postgres mydb
+
+# 10 clients, 2 threads, 1000 transactions per client
+pgbench -c 10 -j 2 -t 1000 -U postgres mydb
+```
+
+### Key run options
+
+| Flag | Description |
+|------|-------------|
+| `-c NUM` / `--client` | Number of concurrent clients (default: 1) |
+| `-j NUM` / `--jobs` | Number of worker threads (default: 1). Set to the number of CPU cores or less. |
+| `-t NUM` / `--transactions` | Number of transactions per client (default: 10) |
+| `-T SECS` / `--time` | Run for this many seconds instead of a fixed transaction count |
+| `-f FILENAME` / `--file` | Use a custom SQL script file |
+| `-P SECS` / `--progress` | Show progress every SECS seconds |
+| `-n` / `--no-vacuum` | Skip VACUUM at the start of a run |
+| `-M PROTOCOL` / `--protocol` | Query submission protocol: `simple`, `extended`, `prepared` |
+| `--latency-limit=MS` | Count transactions taking more than MS milliseconds as late |
+| `--rate=TPS` | Target rate in transactions per second |
+| `-r` / `--report-per-command` | Report per-statement latencies in addition to per-transaction |
+
+## Example benchmark run
+
+```bash
+pgbench -c 20 -j 4 -T 120 -U postgres -p 5432 mydb
+```
+
+Sample output:
+
+```
+starting vacuum...end.
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 10
+query mode: simple
+number of clients: 20
+number of threads: 4
+maximum number of tries: 1
+duration: 120 s
+number of transactions actually processed: 284621
+number of failed transactions: 0 (0.000%)
+latency average = 8.431 ms
+latency stddev = 5.284 ms
+initial connection time = 45.861 ms
+tps = 2371.769 (without initial connection time)
+```
+
+### Interpreting the output
+
+| Metric | Description |
+|--------|-------------|
+| `tps` | Transactions per second (the primary benchmark result) |
+| `latency average` | Mean transaction latency in milliseconds |
+| `latency stddev` | Standard deviation of transaction latency |
+| `initial connection time` | Time to establish all client connections |
+| `number of failed transactions` | Transactions that failed (errors or retries exhausted) |
+
+## Built-in TPC-B-like test
+
+The default script (used when no `-f` is given) approximates TPC-B. Each transaction:
+
+1. `BEGIN`
+2. `UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid`
+3. `SELECT abalance FROM pgbench_accounts WHERE aid = :aid`
+4. `UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid`
+5. `UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid`
+6. `INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP)`
+7. `END`
+
+Other built-in scripts:
+
+```bash
+# SELECT-only workload (read-only benchmark)
+pgbench -b select-only -c 10 -j 2 -T 60 mydb
+
+# Simple update workload
+pgbench -b simple-update -c 10 -j 2 -T 60 mydb
+
+# List available built-in scripts
+pgbench -b list
+```
+
+## Custom scripts
+
+You can write custom scripts using pgbench's scripting language.
+
+### Script syntax
+
+| Command | Description |
+|---------|-------------|
+| `\set varname expr` | Set a script variable to an expression |
+| `\sleep N ms\|s\|us` | Sleep for N milliseconds, seconds, or microseconds |
+| `\if expr` / `\elif` / `\else` / `\endif` | Conditional execution |
+| `\setshell varname cmd` | Execute a shell command and store its output |
+| `\gset [prefix]` | Store the result of the last SQL query into variables |
+
+### Built-in variables
+
+| Variable | Description |
+|----------|-------------|
+| `:client_id` | Zero-based ID of the current client |
+| `:default_seed` | Seed for random functions |
+| `:scale` | The scale factor used for initialization |
+| `:random_seed` | Random seed value |
+
+### Built-in functions
+
+| Function | Description |
+|----------|-------------|
+| `random(lb, ub)` | Uniform random integer in [lb, ub] |
+| `random_gaussian(lb, ub, param)` | Gaussian-distributed random integer |
+| `random_exponential(lb, ub, param)` | Exponentially-distributed random integer |
+| `random_zipfian(lb, ub, param)` | Zipfian-distributed random integer |
+| `permute(i, size [, seed])` | Pseudo-random permutation of i in [0, size) |
+
+### Example: custom read-heavy workload
+
+```sql
+-- custom_read.sql
+-- A mix of point lookups and range scans
+
+\set aid random(1, 100000 * :scale)
+\set bid random(1, :scale)
+
+BEGIN;
+SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+SELECT count(*) FROM pgbench_accounts
+  WHERE bid = :bid AND abalance > 0;
+END;
+```
+
+Run it:
+
+```bash
+pgbench -f custom_read.sql -c 20 -j 4 -T 60 -U postgres mydb
+```
+
+### Example: mixed read/write workload with sleep
+
+```sql
+-- mixed_workload.sql
+
+\set aid random(1, 100000 * :scale)
+\set delta random(-5000, 5000)
+
+BEGIN;
+UPDATE pgbench_accounts
+  SET abalance = abalance + :delta
+  WHERE aid = :aid;
+SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+\sleep 1 ms
+END;
+```
+
+### Conditional script
+
+```sql
+-- conditional.sql
+\set rand random(1, 10)
+
+\if :rand <= 7
+  -- 70% of transactions are reads
+  SELECT abalance FROM pgbench_accounts
+    WHERE aid = random(1, 100000 * :scale);
+\else
+  -- 30% are writes
+  \set aid random(1, 100000 * :scale)
+  \set delta random(-1000, 1000)
+  UPDATE pgbench_accounts SET abalance = abalance + :delta
+    WHERE aid = :aid;
+\endif
+```
+
+## Running multiple scripts with weights
+
+You can specify multiple scripts with their relative weights:
+
+```bash
+# 80% selects, 20% updates
+pgbench \
+  -f select_script.sql@8 \
+  -f update_script.sql@2 \
+  -c 10 -j 2 -T 60 mydb
+```
+
+## Connection options
+
+```bash
+pgbench -h hostname -p 5432 -U username -d mydb [options]
+# or
+pgbench "postgresql://username@hostname/mydb" [options]
+```

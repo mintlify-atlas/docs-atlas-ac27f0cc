@@ -1,0 +1,243 @@
+---
+title: PL/Tcl — Tcl procedural language
+description: Write PostgreSQL functions and procedures in Tcl using PL/Tcl (trusted) or PL/TclU (untrusted). Covers function creation, arguments, SPI access, and trigger support.
+---
+
+PL/Tcl is a loadable procedural language for PostgreSQL that enables functions and procedures to be written in the [Tcl](https://www.tcl.tk/) scripting language. It offers most of the capabilities of a C-language function, plus the powerful string-processing libraries available to Tcl.
+
+<CardGroup cols={2}>
+  <Card title="PL/Tcl (pltcl)" icon="shield-check">
+    Trusted. Executes inside a safe Tcl interpreter with restricted command access. Available to non-superusers.
+  </Card>
+  <Card title="PL/TclU (pltclu)" icon="triangle-exclamation">
+    Untrusted. Full Tcl interpreter. Can access the filesystem and network. Superuser-only.
+  </Card>
+</CardGroup>
+
+<Note>
+Tcl functions cannot be used to create input/output functions for new base data types.
+</Note>
+
+## Installation
+
+```sql
+CREATE EXTENSION pltcl;   -- trusted variant
+CREATE EXTENSION pltclu;  -- untrusted variant
+```
+
+## Creating functions
+
+```sql
+CREATE FUNCTION funcname (argument-types) RETURNS return-type AS $$
+    # PL/Tcl function body
+$$ LANGUAGE pltcl;
+```
+
+Arguments are passed as Tcl variables named `1`, `2`, ..., `n`. Use `$1`, `$2`, etc. to access them. The result is returned with a Tcl `return` statement.
+
+**Example:**
+
+```sql
+CREATE FUNCTION tcl_max(integer, integer) RETURNS integer AS $$
+    if {$1 > $2} {return $1}
+    return $2
+$$ LANGUAGE pltcl STRICT;
+```
+
+`STRICT` means PostgreSQL will not call the function if any argument is NULL, and will return NULL automatically instead.
+
+### Handling NULL arguments
+
+In a non-strict function, NULL arguments produce an empty string for the corresponding variable. Use `argisnull` to detect NULLs and `return_null` to return NULL:
+
+```sql
+CREATE FUNCTION tcl_max(integer, integer) RETURNS integer AS $$
+    if {[argisnull 1]} {
+        if {[argisnull 2]} { return_null }
+        return $2
+    }
+    if {[argisnull 2]} { return $1 }
+    if {$1 > $2} {return $1}
+    return $2
+$$ LANGUAGE pltcl;
+```
+
+## Composite type arguments and return values
+
+### Receiving composite types
+
+Composite-type arguments are passed as Tcl arrays (associative arrays). The element names are the attribute names. NULL attributes are absent from the array:
+
+```sql
+CREATE TABLE employee (
+    name    text,
+    salary  integer,
+    age     integer
+);
+
+CREATE FUNCTION overpaid(employee) RETURNS boolean AS $$
+    if {200000.0 < $1(salary)} {
+        return "t"
+    }
+    if {$1(age) < 30 && 100000.0 < $1(salary)} {
+        return "t"
+    }
+    return "f"
+$$ LANGUAGE pltcl;
+```
+
+### Returning composite types
+
+Return a list of column-name/value pairs:
+
+```sql
+CREATE FUNCTION square_cube(IN x int, OUT squared int, OUT cubed int) AS $$
+    return [list squared [expr {$1 * $1}] cubed [expr {$1 * $1 * $1}]]
+$$ LANGUAGE pltcl;
+
+SELECT * FROM square_cube(4);  -- squared=16, cubed=64
+```
+
+Omitted columns are returned as NULL; unexpected column names raise an error.
+
+### Procedures with INOUT parameters
+
+```sql
+CREATE PROCEDURE tcl_triple(INOUT a integer, INOUT b integer) AS $$
+    return [list a [expr {$1 * 3}] b [expr {$2 * 3}]]
+$$ LANGUAGE pltcl;
+
+CALL tcl_triple(5, 10);  -- a=15, b=30
+```
+
+### Set-returning functions
+
+Use `return_next` to return multiple rows:
+
+```sql
+CREATE FUNCTION tcl_sequence(n integer)
+    RETURNS SETOF integer AS $$
+    for {set i 1} {$i <= $1} {incr i} {
+        return_next $i
+    }
+$$ LANGUAGE pltcl;
+
+SELECT * FROM tcl_sequence(5);  -- 1 2 3 4 5
+```
+
+## Database access (SPI)
+
+### spi_exec
+
+Executes a query string and returns the number of rows affected. For `SELECT`, a callback command is invoked for each row:
+
+```tcl
+spi_exec "SELECT id, name FROM users WHERE active = 't'" {
+    elog NOTICE "User $id: $name"
+}
+```
+
+The column values are set as local Tcl variables with the column names inside the callback.
+
+Limit the number of returned rows:
+
+```tcl
+spi_exec -count 10 "SELECT * FROM big_table" {
+    # process row
+}
+```
+
+### spi_prepare and spi_execp
+
+For queries run multiple times, prepare a plan first:
+
+```tcl
+set plan [spi_prepare "SELECT * FROM accounts WHERE id = \$1 AND type = \$2" \
+               {integer text}]
+
+# Execute the prepared plan
+set nrows [spi_execp -count 1 $plan [list 42 "checking"] {
+    elog NOTICE "Balance: $balance"
+}]
+```
+
+Arguments to `spi_execp` are passed as a Tcl list.
+
+### spi_lastoid
+
+Returns the OID of the last row inserted by a `spi_exec` call, if the table has OIDs.
+
+### Accessing query results as variables
+
+After `spi_exec` or `spi_execp` with a callback body, each row’s column values are available as Tcl variables named after the columns within the callback body.
+
+## Messaging
+
+Use `elog` to send messages:
+
+```tcl
+elog DEBUG   "Debug information"
+elog LOG     "Log entry"
+elog INFO    "Informational"
+elog NOTICE  "Notice: processing $id"
+elog WARNING "Something looks off"
+elog ERROR   "Something went wrong"   ;# raises an exception
+```
+
+`elog ERROR` and `elog FATAL` do not return.
+
+## Triggers
+
+Trigger functions use special Tcl global variables populated by PL/Tcl:
+
+| Variable | Description |
+|----------|-------------|
+| `$TG_name` | Trigger name |
+| `$TG_relid` | OID of the table |
+| `$TG_table_name` | Table name |
+| `$TG_table_schema` | Schema name |
+| `$TG_relatts` | List of column names |
+| `$TG_when` | `BEFORE`, `AFTER`, or `INSTEAD OF` |
+| `$TG_level` | `ROW` or `STATEMENT` |
+| `$TG_op` | `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` |
+| `$TG_argv` | List of trigger arguments |
+| `$NEW` | Array of new row values (INSERT/UPDATE) |
+| `$OLD` | Array of old row values (UPDATE/DELETE) |
+
+**Example — audit trigger:**
+
+```sql
+CREATE FUNCTION tcl_audit_trigger() RETURNS trigger AS $$
+    if {$TG_op eq "INSERT" || $TG_op eq "UPDATE"} {
+        spi_exec "INSERT INTO audit_log (tbl, op, ts, new_name) \
+                  VALUES ('$TG_table_name', '$TG_op', now(), '$NEW(name)')"
+    }
+    return OK
+$$ LANGUAGE pltcl;
+
+CREATE TRIGGER audit_employees
+    AFTER INSERT OR UPDATE ON employees
+    FOR EACH ROW EXECUTE FUNCTION tcl_audit_trigger();
+```
+
+Return values for row triggers:
+- `OK` — proceed with original row
+- `SKIP` — suppress the operation (BEFORE only)
+- Modified array name or `MODIFY` — proceed using the modified `$NEW`
+
+## Per-function persistent state
+
+PL/Tcl provides a persistent associative array `shared_hash` (available as `array set`/`array get` on the `shared` array) that is preserved between calls of the same function within a session. There is also a global hash `pgstartup_calls` available across all PL/Tcl functions.
+
+For simple per-call caching:
+
+```tcl
+if {![info exists plan]} {
+    set plan [spi_prepare "SELECT email FROM users WHERE id = \$1" {integer}]
+}
+spi_execp -count 1 $plan [list $1] {
+    return $email
+}
+```
+
+Declaring `plan` with `global plan` at the top of the function body makes it persist between calls.

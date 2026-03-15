@@ -1,0 +1,338 @@
+---
+title: "Installation"
+description: "Install PostgreSQL from source or using a package manager on Linux, macOS, and Windows. Covers build requirements, configure options, and post-install setup."
+---
+
+PostgreSQL can be installed from pre-built packages (the easiest path for most users) or compiled from source (useful for custom builds, the latest development version, or platforms without official packages).
+
+<Tabs>
+  <Tab title="From packages">
+    ## Package manager installation
+
+    Pre-built packages are maintained by the PostgreSQL community and handle `initdb`, service registration, and sensible defaults.
+
+    ### Debian and Ubuntu
+
+    The [PGDG apt repository](https://apt.postgresql.org/) provides packages for all active PostgreSQL versions.
+
+    ```bash
+    # Install the repository configuration package
+    sudo apt install -y curl ca-certificates
+    sudo install -d /usr/share/postgresql-common/pgdg
+    sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+
+    # Create the repository sources list
+    sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+      https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list'
+
+    sudo apt update
+    sudo apt install -y postgresql-16
+    ```
+
+    The package creates a `postgres` system user, initializes a cluster at `/var/lib/postgresql/16/main`, and starts the service.
+
+    ### RHEL, Rocky Linux, AlmaLinux, Fedora
+
+    ```bash
+    # Install the PGDG repository RPM
+    sudo dnf install -y \
+      https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+    # Disable the built-in module to avoid conflicts
+    sudo dnf -qy module disable postgresql
+
+    # Install server and contrib
+    sudo dnf install -y postgresql16-server postgresql16-contrib
+
+    # Initialize the database cluster
+    sudo /usr/pgsql-16/bin/postgresql-16-setup initdb
+
+    # Enable and start the service
+    sudo systemctl enable --now postgresql-16
+    ```
+
+    ### macOS (Homebrew)
+
+    ```bash
+    brew install postgresql@16
+    brew services start postgresql@16
+
+    # Add binaries to PATH
+    echo 'export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"' >> ~/.zshrc
+    source ~/.zshrc
+    ```
+
+    ### Windows
+
+    Download the interactive installer from [postgresql.org/download/windows](https://www.postgresql.org/download/windows/). The installer:
+
+    - Installs the server, pgAdmin, Stack Builder, and command-line tools
+    - Runs `initdb` to create the data directory (default: `C:\Program Files\PostgreSQL\16\data`)
+    - Registers a Windows service named `postgresql-x64-16`
+    - Optionally installs additional drivers and extensions via Stack Builder
+
+    <Warning>
+      On Windows, the default port is 5432. If that port is in use, the installer will prompt you to choose another.
+    </Warning>
+  </Tab>
+  <Tab title="From source">
+    ## Building from source
+
+    Building from source gives you full control over compile-time options, optional features, and installation prefix.
+
+    ### Requirements
+
+    The following are required to build PostgreSQL:
+
+    | Requirement | Minimum version | Notes |
+    |---|---|---|
+    | GNU make | 3.81 | Use `gmake` on some systems |
+    | C compiler | C11 support | GCC recommended |
+    | Flex | — | Must be Flex (not other lex) |
+    | Bison | 2.3 | Must be Bison (not other yacc) |
+    | Perl | 5.14 | Required for build scripts and test suites |
+    | GNU Readline | — | Strongly recommended for `psql`; disable with `--without-readline` |
+    | zlib | — | Required unless `--without-zlib` is passed |
+    | ICU4C | 4.2 | Required unless `--without-icu` is passed |
+
+    Optional packages needed for specific features:
+
+    | Package | Feature |
+    |---|---|
+    | OpenSSL (≥ 1.1.1) | SSL connections, `pgcrypto`, `/dev/urandom` fallback |
+    | MIT Kerberos / OpenLDAP / PAM | Authentication using those services |
+    | LZ4 | `lz4` WAL and TOAST compression |
+    | Zstandard (≥ 1.4.0) | `zstd` WAL compression |
+    | Python 3.6+ | PL/Python procedural language |
+    | Perl 5.14 (shared library) | PL/Perl procedural language |
+    | Tcl 8.4+ | PL/Tcl procedural language |
+
+    ### Download the source
+
+    ```bash
+    # Download and unpack a release tarball
+    tar xf postgresql-16.x.tar.bz2
+    cd postgresql-16.x
+    ```
+
+    Or clone from Git:
+
+    ```bash
+    git clone https://git.postgresql.org/git/postgresql.git
+    cd postgresql
+    ```
+
+    ### Configure
+
+    The first step is to configure the source tree for your system. For a default installation:
+
+    ```bash
+    ./configure
+    ```
+
+    This runs system probes and creates the build files. You can supply options to customize the build:
+
+    ```bash
+    ./configure \
+      --prefix=/usr/local/pgsql \
+      --with-openssl \
+      --with-icu \
+      --with-perl \
+      --with-python \
+      --enable-debug
+    ```
+
+    Common `configure` options:
+
+    | Option | Effect |
+    |---|---|
+    | `--prefix=DIR` | Install under `DIR` (default: `/usr/local/pgsql`) |
+    | `--with-openssl` | Build with OpenSSL support for SSL connections |
+    | `--with-icu` | Build with ICU support for collations (default on) |
+    | `--with-perl` | Build PL/Perl |
+    | `--with-python` | Build PL/Python |
+    | `--with-tcl` | Build PL/Tcl |
+    | `--enable-debug` | Build with debugging symbols (`-g`) |
+    | `--enable-cassert` | Enable assertion checking (development only) |
+    | `--without-readline` | Disable GNU Readline in `psql` |
+    | `--without-zlib` | Disable zlib (disables compressed dumps) |
+
+    To build in a separate directory (VPATH build):
+
+    ```bash
+    mkdir build
+    cd build
+    /path/to/source/configure --prefix=/usr/local/pgsql
+    ```
+
+    ### Build
+
+    ```bash
+    make
+    ```
+
+    To build everything including `contrib` modules:
+
+    ```bash
+    make world-bin
+    ```
+
+    ### Run regression tests (optional)
+
+    ```bash
+    make check
+    ```
+
+    <Note>
+      Do not run `make check` as root — the test suite must run as an unprivileged user. All tests should pass; failures indicate a problem with your platform or build options.
+    </Note>
+
+    ### Install
+
+    ```bash
+    sudo make install
+    ```
+
+    Or with contrib modules:
+
+    ```bash
+    sudo make install-world-bin
+    ```
+
+    This installs binaries, libraries, and headers under the configured prefix. The `make install-strip` variant strips debugging symbols to reduce disk usage.
+  </Tab>
+</Tabs>
+
+## Post-installation setup
+
+After installing (from source), or on platforms where the package manager does not automatically initialize the cluster, perform these steps.
+
+<Steps>
+  <Step title="Create the postgres system user">
+    PostgreSQL should run under a dedicated system account, not as root.
+
+    ```bash
+    sudo useradd --system --create-home --shell /bin/bash postgres
+    ```
+
+    Pre-packaged versions create this user automatically during installation.
+  </Step>
+
+  <Step title="Initialize the database cluster">
+    A database cluster is a single directory on disk that contains all the databases managed by one server instance.
+
+    ```bash
+    sudo mkdir -p /usr/local/pgsql/data
+    sudo chown postgres /usr/local/pgsql/data
+    sudo -u postgres initdb -D /usr/local/pgsql/data
+    ```
+
+    `initdb` creates system catalogs, writes `postgresql.conf` and `pg_hba.conf`, and initializes three databases: `postgres`, `template1`, and `template0`.
+
+    To set a password for the superuser at init time:
+
+    ```bash
+    sudo -u postgres initdb -D /usr/local/pgsql/data \
+      --pwprompt \
+      -A scram-sha-256
+    ```
+
+    <Warning>
+      The default `trust` authentication allows any local user to connect as any database user without a password. For production systems, always set a password and change the authentication method in `pg_hba.conf`.
+    </Warning>
+  </Step>
+
+  <Step title="Start the server">
+    ```bash
+    sudo -u postgres pg_ctl start \
+      -D /usr/local/pgsql/data \
+      -l /var/log/postgresql/server.log
+    ```
+
+    To start at boot using systemd, create `/etc/systemd/system/postgresql.service`:
+
+    ```ini
+    [Unit]
+    Description=PostgreSQL database server
+    Documentation=man:postgres(1)
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=notify
+    User=postgres
+    ExecStart=/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data
+    ExecReload=/bin/kill -HUP $MAINPID
+    KillMode=mixed
+    KillSignal=SIGINT
+    Restart=on-failure
+    TimeoutSec=infinity
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+
+    Then enable it:
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now postgresql
+    ```
+  </Step>
+
+  <Step title="Add binaries to PATH (source installs)">
+    ```bash
+    echo 'export PATH=/usr/local/pgsql/bin:$PATH' >> ~/.profile
+    source ~/.profile
+    ```
+  </Step>
+
+  <Step title="Connect and verify">
+    ```bash
+    sudo -u postgres psql -c "SELECT version();"
+    ```
+
+    ```
+     PostgreSQL 16.x on x86_64-pc-linux-gnu, compiled by gcc ...
+    ```
+  </Step>
+</Steps>
+
+## Configuring client authentication
+
+PostgreSQL client authentication is controlled by `pg_hba.conf` (Host Based Authentication) in the data directory. Each record specifies a connection type, database, user, client address, and authentication method.
+
+```
+# TYPE  DATABASE  USER     ADDRESS         METHOD
+local   all       postgres                 peer
+local   all       all                      scram-sha-256
+host    all       all      127.0.0.1/32    scram-sha-256
+host    all       all      ::1/128         scram-sha-256
+```
+
+After editing `pg_hba.conf`, reload the server to apply changes:
+
+```bash
+pg_ctl reload -D /usr/local/pgsql/data
+# or
+sudo systemctl reload postgresql
+```
+
+## Uninstalling
+
+For source builds:
+
+```bash
+# Remove installed files
+make uninstall
+
+# Clean build artifacts
+make clean
+
+# Reset source tree to distributed state
+make distclean
+```
+
+For package installs, use the package manager's remove command (e.g., `apt remove postgresql-16` or `dnf remove postgresql16-server`).

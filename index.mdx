@@ -1,97 +1,77 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "PostgreSQL Documentation"
+description: "The world's most advanced open-source relational database"
 ---
 
-## Setting up
+<img
+  src="https://media.brand.dev/bbce1c6d-f0d7-45ea-8578-4e29b2e68eb1.jpg"
+  alt="PostgreSQL"
+  style={{ height: '60px', marginBottom: '24px' }}
+/>
 
-Get your documentation site up and running in minutes.
+PostgreSQL is a powerful, open-source object-relational database system with over 35 years of active development. It has earned a strong reputation for reliability, feature robustness, and performance — trusted by millions of developers and organizations worldwide.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Install PostgreSQL and run your first queries in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="download" href="/installation">
+    Detailed installation instructions for all platforms.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand PostgreSQL's architecture, MVCC, and transaction model.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="SQL Reference" icon="database" href="/sql/ddl-overview">
+    Complete reference for PostgreSQL's SQL dialect and extensions.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why PostgreSQL?
 
-Everything you need to create world-class documentation.
+PostgreSQL is not just a database — it's an extensible platform that goes far beyond standard SQL.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="ACID Transactions" icon="shield-check">
+    Full ACID compliance with multi-version concurrency control (MVCC) ensures data integrity without sacrificing performance.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Advanced SQL" icon="code">
+    Window functions, CTEs, lateral joins, full-text search, and an extended SQL standard that keeps growing.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="JSON & Document Store" icon="brackets-curly">
+    Native JSON and JSONB types let you store and query document data alongside relational data in the same database.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Extensibility" icon="puzzle-piece">
+    Define custom types, functions, operators, index methods, and procedural languages. Build extensions that integrate deeply with the engine.
   </Card>
-</Columns>
+  <Card title="High Availability" icon="server">
+    Streaming replication, logical replication, and built-in support for standby servers and failover.
+  </Card>
+  <Card title="Security" icon="lock">
+    Row-level security, SSL/TLS, SCRAM-SHA-256 authentication, and fine-grained privilege management.
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Explore the documentation
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Administration" icon="gear" href="/admin/server-setup">
+    Set up, configure, and maintain your PostgreSQL server. Covers authentication, backup, replication, and monitoring.
+  </Card>
+  <Card title="Developer Guide" icon="terminal" href="/dev/libpq">
+    Use libpq, ECPG, or one of the procedural languages (PL/pgSQL, PL/Python, PL/Perl, PL/Tcl) to build applications.
+  </Card>
+  <Card title="Tools & Extensions" icon="wrench" href="/tools/psql">
+    Master psql, pg_dump, pg_ctl, pg_upgrade, pgbench, and the rich ecosystem of bundled extensions.
+  </Card>
+  <Card title="Extending PostgreSQL" icon="plug" href="/dev/extending-overview">
+    Write custom functions, types, operators, foreign data wrappers, and table access methods.
+  </Card>
+</CardGroup>
+
+## About this documentation
+
+This documentation covers PostgreSQL's source code structure, SQL dialect, administration, developer interfaces, and extension APIs. It is generated from the [postgres/postgres](https://github.com/postgres/postgres) mirror of the official PostgreSQL repository.
+
+<Note>
+  PostgreSQL development happens on the official [PostgreSQL mailing lists](https://www.postgresql.org/community/lists/). Pull requests on GitHub are not reviewed — to contribute, see the [Submitting a Patch](https://wiki.postgresql.org/wiki/Submitting_a_Patch) wiki page.
+</Note>

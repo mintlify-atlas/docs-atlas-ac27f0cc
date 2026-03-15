@@ -1,0 +1,205 @@
+---
+title: hstore
+description: Store and query key-value pairs within a single PostgreSQL column using the hstore extension.
+---
+
+The `hstore` module implements the `hstore` data type for storing sets of key-value pairs within a single PostgreSQL value. It is useful for rows with many attributes that are rarely examined, semi-structured data, or cases where you want a schemaless column alongside structured columns.
+
+Keys and values are text strings. Values can be SQL `NULL`; keys cannot.
+
+## Installation
+
+`hstore` is a trusted extension and can be installed by any user with `CREATE` privilege:
+
+```sql
+CREATE EXTENSION hstore;
+```
+
+## Literal syntax
+
+An `hstore` value is represented as a comma-separated list of `key => value` pairs:
+
+```sql
+-- A simple hstore
+SELECT 'color => red, size => large'::hstore;
+
+-- Keys or values with spaces, commas, = or > must be double-quoted
+SELECT '"product name" => "Super Widget", price => 9.99'::hstore;
+
+-- NULL values (case-insensitive)
+SELECT 'color => NULL, size => medium'::hstore;
+
+-- Duplicate keys: only one entry is kept (unspecified which)
+SELECT 'a => 1, a => 2'::hstore;
+-- "a"=>"1"
+```
+
+On output, keys and values are always double-quoted. Order of pairs is not preserved.
+
+## Operators
+
+| Operator | Signature | Description | Example |
+|----------|-----------|-------------|----------|
+| `->` | `hstore -> text` | Get value for a key, or NULL | `'a=>1,b=>2'::hstore -> 'a'` → `1` |
+| `->` | `hstore -> text[]` | Get values for an array of keys | `'a=>1,b=>2'::hstore -> ARRAY['a','b']` → `{1,2}` |
+| `\|\|` | `hstore \|\| hstore` | Concatenate two hstores (right side wins on conflict) | `'a=>1'::hstore \|\| 'b=>2'::hstore` → `"a"=>"1", "b"=>"2"` |
+| `?` | `hstore ? text` | Does hstore contain the key? | `'a=>1'::hstore ? 'a'` → `t` |
+| `?&` | `hstore ?& text[]` | Does hstore contain all specified keys? | `'a=>1,b=>2'::hstore ?& ARRAY['a','b']` → `t` |
+| `?\|` | `hstore ?\| text[]` | Does hstore contain any of the specified keys? | `'a=>1,b=>2'::hstore ?\| ARRAY['b','c']` → `t` |
+| `@>` | `hstore @> hstore` | Does left operand contain right? | `'a=>1,b=>2'::hstore @> 'b=>2'` → `t` |
+| `<@` | `hstore <@ hstore` | Is left operand contained in right? | `'a=>1'::hstore <@ 'a=>1,b=>2'` → `t` |
+| `-` | `hstore - text` | Delete a key | `'a=>1,b=>2'::hstore - 'a'` → `"b"=>"2"` |
+| `-` | `hstore - text[]` | Delete multiple keys | `'a=>1,b=>2,c=>3'::hstore - ARRAY['a','b']` → `"c"=>"3"` |
+| `-` | `hstore - hstore` | Delete pairs matching the right operand | `'a=>1,b=>2'::hstore - 'a=>1'::hstore` → `"b"=>"2"` |
+| `%%` | `%% hstore` | Convert to alternating key/value array | `%% 'a=>1,b=>2'::hstore` → `{a,1,b,2}` |
+| `%#` | `%# hstore` | Convert to two-dimensional key/value array | `%# 'a=>1,b=>2'::hstore` → `{{a,1},{b,2}}` |
+| `#=` | `anyelement #= hstore` | Replace fields in a composite type with matching hstore values | `ROW(1,3) #= 'f1=>11'::hstore` → `(11,3)` |
+
+## Functions
+
+### Construction
+
+| Function | Description | Example |
+|----------|-------------|----------|
+| `hstore(record)` | Build hstore from a row | `hstore(ROW(1,2))` → `"f1"=>"1", "f2"=>"2"` |
+| `hstore(text[])` | Build from alternating key/value array or 2-D array | `hstore(ARRAY['a','1','b','2'])` → `"a"=>"1", "b"=>"2"` |
+| `hstore(text[], text[])` | Build from separate key and value arrays | `hstore(ARRAY['a','b'], ARRAY['1','2'])` → `"a"=>"1", "b"=>"2"` |
+| `hstore(text, text)` | Make a single-item hstore | `hstore('a', 'b')` → `"a"=>"b"` |
+
+### Inspection
+
+| Function | Returns | Description | Example |
+|----------|---------|-------------|----------|
+| `akeys(hstore)` | `text[]` | Extract keys as an array | `akeys('a=>1,b=>2')` → `{a,b}` |
+| `skeys(hstore)` | `setof text` | Extract keys as a set | `skeys('a=>1,b=>2')` → rows `a`, `b` |
+| `avals(hstore)` | `text[]` | Extract values as an array | `avals('a=>1,b=>2')` → `{1,2}` |
+| `svals(hstore)` | `setof text` | Extract values as a set | `svals('a=>1,b=>2')` → rows `1`, `2` |
+| `each(hstore)` | `setof record(key text, value text)` | Expand hstore to key-value rows | `SELECT * FROM each('a=>1,b=>2')` |
+| `exist(hstore, text)` | `boolean` | Does hstore contain the key? | `exist('a=>1', 'a')` → `t` |
+| `defined(hstore, text)` | `boolean` | Does hstore contain a non-NULL value for the key? | `defined('a=>NULL', 'a')` → `f` |
+| `slice(hstore, text[])` | `hstore` | Extract a subset of keys | `slice('a=>1,b=>2,c=>3'::hstore, ARRAY['a','b'])` → `"a"=>"1", "b"=>"2"` |
+
+### Conversion
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `hstore_to_array(hstore)` | `text[]` | Alternating keys and values: `{a,1,b,2}` |
+| `hstore_to_matrix(hstore)` | `text[]` | Two-dimensional array: `{{a,1},{b,2}}` |
+| `hstore_to_json(hstore)` | `json` | Convert to JSON (all values become JSON strings) |
+| `hstore_to_jsonb(hstore)` | `jsonb` | Convert to JSONB (all values become JSON strings) |
+| `hstore_to_json_loose(hstore)` | `json` | Convert to JSON, attempting to detect numeric and boolean values |
+| `hstore_to_jsonb_loose(hstore)` | `jsonb` | Same as above but returns JSONB |
+
+### Deletion
+
+| Function | Description |
+|----------|-------------|
+| `delete(hstore, text)` | Delete the pair with the matching key |
+| `delete(hstore, text[])` | Delete pairs with any of the matching keys |
+| `delete(hstore, hstore)` | Delete pairs that exactly match pairs in the right operand |
+
+## Indexing
+
+`hstore` supports both GiST and GIN indexes on the whole column:
+
+```sql
+-- GIN index (faster for containment queries with @>, ?, ?&, ?|)
+CREATE INDEX attributes_gin ON products USING GIN (attributes);
+
+-- GiST index (also supports containment operators)
+CREATE INDEX attributes_gist ON products USING GIST (attributes);
+```
+
+## Practical examples
+
+<Tabs>
+  <Tab title="Product attributes">
+```sql
+CREATE TABLE products (
+  id      serial PRIMARY KEY,
+  name    text NOT NULL,
+  attrs   hstore
+);
+
+INSERT INTO products (name, attrs) VALUES
+  ('T-Shirt', 'color => red,  size => L,    material => cotton'),
+  ('T-Shirt', 'color => blue, size => M,    material => cotton'),
+  ('Jacket',  'color => black, size => XL,  material => nylon,  waterproof => true');
+
+-- Find all large red items
+SELECT name, attrs
+FROM products
+WHERE attrs @> 'color => red, size => L'::hstore;
+
+-- Find all items that have a 'waterproof' attribute
+SELECT name FROM products WHERE attrs ? 'waterproof';
+
+-- Get the color of each product
+SELECT name, attrs -> 'color' AS color FROM products;
+
+-- Find all distinct sizes
+SELECT DISTINCT attrs -> 'size' AS size FROM products ORDER BY 1;
+```
+  </Tab>
+  <Tab title="Adding and updating keys">
+```sql
+-- Add a new key to an existing row
+UPDATE products
+SET attrs = attrs || 'in_stock => true'::hstore
+WHERE id = 1;
+
+-- Remove a key
+UPDATE products
+SET attrs = attrs - 'waterproof'
+WHERE id = 3;
+
+-- Replace a value
+UPDATE products
+SET attrs = attrs || hstore('color', 'green')
+WHERE id = 1;
+```
+  </Tab>
+  <Tab title="Expanding hstore to rows">
+```sql
+-- Expand each attribute into its own row
+SELECT p.name, (each(p.attrs)).*
+FROM products p;
+
+--    name    |    key    | value
+-- -----------+-----------+-------
+--  T-Shirt   | color     | red
+--  T-Shirt   | size      | L
+--  T-Shirt   | material  | cotton
+-- ...
+```
+  </Tab>
+  <Tab title="Convert to JSON">
+```sql
+SELECT name, hstore_to_json(attrs) AS json_attrs
+FROM products;
+
+-- Use cast syntax instead
+SELECT name, attrs::json AS json_attrs FROM products;
+SELECT name, attrs::jsonb AS jsonb_attrs FROM products;
+```
+  </Tab>
+</Tabs>
+
+## Querying all keys and values
+
+```sql
+-- List all keys used across any row in the table
+SELECT DISTINCT key
+FROM (SELECT (each(attrs)).key FROM products) t
+ORDER BY key;
+
+-- Count products by color
+SELECT attrs -> 'color' AS color, count(*)
+FROM products
+GROUP BY color
+ORDER BY count DESC;
+```
+
+<Note>
+For JSON-centric use cases, consider `jsonb` instead of `hstore`. `jsonb` supports nested structures, a richer set of operators, and has continued to receive investment. `hstore` remains useful for simple string key-value stores, especially in legacy code, or where interoperability with the `hstore` type is required.
+</Note>

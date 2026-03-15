@@ -1,0 +1,422 @@
+---
+title: Foreign data wrappers
+description: Write a Foreign Data Wrapper (FDW) to connect PostgreSQL to external data sources. Covers FdwRoutine callbacks, planning and scanning, writable FDW support, and the SQL commands for registering wrappers, servers, and user mappings.
+---
+
+A Foreign Data Wrapper (FDW) lets PostgreSQL query and modify data in external systems — other databases, REST APIs, files, or any other source — through standard SQL. All operations on a foreign table are handled through the FDW's callback functions.
+
+The `postgres_fdw` (included) and `file_fdw` (included) extensions are good reference implementations. Both are in the `contrib/` directory of the PostgreSQL source tree.
+
+## Architecture overview
+
+```
+   SQL query
+       ↓
+   Planner calls GetForeignRelSize, GetForeignPaths, GetForeignPlan
+       ↓
+   Executor calls BeginForeignScan
+       ↓
+   IterateForeignScan (called repeatedly until it returns NULL)
+       ↓
+   EndForeignScan
+```
+
+For write operations:
+
+```
+   INSERT/UPDATE/DELETE
+       ↓
+   Planner: PlanForeignModify
+       ↓
+   Executor: BeginForeignModify
+       ↓
+   ExecForeignInsert / ExecForeignUpdate / ExecForeignDelete (per row)
+       ↓
+   EndForeignModify
+```
+
+## The FdwRoutine struct
+
+The FDW handler function returns a `palloc`'d `FdwRoutine` struct (defined in `src/include/foreign/fdwapi.h`). Scan-related functions are required; the rest are optional.
+
+```c
+#include "postgres.h"
+#include "fmgr.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(my_fdw_handler);
+
+Datum
+my_fdw_handler(PG_FUNCTION_ARGS)
+{
+    FdwRoutine *fdwroutine = makeNode(FdwRoutine);
+
+    /* Required: planning */
+    fdwroutine->GetForeignRelSize  = my_GetForeignRelSize;
+    fdwroutine->GetForeignPaths    = my_GetForeignPaths;
+    fdwroutine->GetForeignPlan     = my_GetForeignPlan;
+
+    /* Required: scanning */
+    fdwroutine->BeginForeignScan   = my_BeginForeignScan;
+    fdwroutine->IterateForeignScan = my_IterateForeignScan;
+    fdwroutine->ReScanForeignScan  = my_ReScanForeignScan;
+    fdwroutine->EndForeignScan     = my_EndForeignScan;
+
+    /* Optional: writable tables */
+    fdwroutine->PlanForeignModify      = my_PlanForeignModify;
+    fdwroutine->BeginForeignModify     = my_BeginForeignModify;
+    fdwroutine->ExecForeignInsert      = my_ExecForeignInsert;
+    fdwroutine->ExecForeignUpdate      = my_ExecForeignUpdate;
+    fdwroutine->ExecForeignDelete      = my_ExecForeignDelete;
+    fdwroutine->EndForeignModify       = my_EndForeignModify;
+
+    /* Optional: EXPLAIN */
+    fdwroutine->ExplainForeignScan     = my_ExplainForeignScan;
+    fdwroutine->ExplainForeignModify   = my_ExplainForeignModify;
+
+    /* Optional: ANALYZE */
+    fdwroutine->AnalyzeForeignTable    = my_AnalyzeForeignTable;
+
+    /* Optional: IMPORT FOREIGN SCHEMA */
+    fdwroutine->ImportForeignSchema    = my_ImportForeignSchema;
+
+    PG_RETURN_POINTER(fdwroutine);
+}
+```
+
+## Planner callbacks
+
+### GetForeignRelSize
+
+```c
+void
+GetForeignRelSize(PlannerInfo *root,
+                  RelOptInfo *baserel,
+                  Oid foreigntableid);
+```
+
+Called at the start of planning for a query that scans a foreign table. Update `baserel->rows` with the estimated row count after applying restriction quals. Optionally update `baserel->width` with the estimated average row width and `baserel->tuples` with the total row count in the foreign table.
+
+Store FDW-private planning state in `baserel->fdw_private`.
+
+### GetForeignPaths
+
+```c
+void
+GetForeignPaths(PlannerInfo *root,
+                RelOptInfo *baserel,
+                Oid foreigntableid);
+```
+
+Generate one or more access paths for scanning the foreign table. Must call `add_path` with at least one `ForeignPath`. Use `create_foreignscan_path` to build paths:
+
+```c
+path = create_foreignscan_path(root, baserel,
+    NULL,           /* default pathtarget */
+    rows,           /* estimated row count */
+    startup_cost,
+    total_cost,
+    NIL,            /* no pathkeys (unsorted) */
+    baserel->lateral_relids,
+    NULL,           /* no extra join condition */
+    fdw_private);   /* FDW-private list */
+add_path(baserel, (Path *) path);
+```
+
+### GetForeignPlan
+
+```c
+ForeignScan *
+GetForeignPlan(PlannerInfo *root,
+               RelOptInfo *baserel,
+               Oid foreigntableid,
+               ForeignPath *best_path,
+               List *tlist,
+               List *scan_clauses,
+               Plan *outer_plan);
+```
+
+Convert the selected `ForeignPath` into a `ForeignScan` plan node. Use `make_foreignscan`:
+
+```c
+return make_foreignscan(tlist,
+    extract_actual_clauses(scan_clauses, false),
+    baserel->relid,
+    NIL,                /* no expressions to evaluate */
+    best_path->fdw_private,
+    NIL,                /* no custom scan tlist */
+    NIL,                /* no remote quals */
+    outer_plan);
+```
+
+## Executor callbacks
+
+### BeginForeignScan
+
+```c
+void
+BeginForeignScan(ForeignScanState *node, int eflags);
+```
+
+Initialize the scan. Open connections, allocate buffers, prepare queries to the remote source. Store state in `node->fdw_state`.
+
+When `eflags & EXEC_FLAG_EXPLAIN_ONLY` is set, do the minimum needed for `ExplainForeignScan` and `EndForeignScan` — do not open network connections or similar.
+
+### IterateForeignScan
+
+```c
+TupleTableSlot *
+IterateForeignScan(ForeignScanState *node);
+```
+
+Fetch one row from the remote source and store it in `node->ss.ss_ScanTupleSlot`. Return that slot, or return NULL when no more rows are available.
+
+Rows are returned in a short-lived memory context reset between calls. If you need longer-lived storage, use `node->ss.ps.state->es_query_cxt` or create a memory context in `BeginForeignScan`.
+
+### ReScanForeignScan
+
+```c
+void
+ReScanForeignScan(ForeignScanState *node);
+```
+
+Restart the scan from the beginning. Note that scan parameters may have changed.
+
+### EndForeignScan
+
+```c
+void
+EndForeignScan(ForeignScanState *node);
+```
+
+End the scan and release resources — close connections to the remote source, free buffers. `palloc`'d memory is reclaimed automatically when the memory context is destroyed, but open file descriptors and network connections must be closed explicitly.
+
+## Write support callbacks
+
+### PlanForeignModify
+
+```c
+List *
+PlanForeignModify(PlannerInfo *root,
+                  ModifyTable *plan,
+                  Index resultRelation,
+                  int subplan_index);
+```
+
+Optional. Performs additional planning for INSERT/UPDATE/DELETE. Returns a `List` of FDW-private data passed to `BeginForeignModify`.
+
+### BeginForeignModify
+
+```c
+void
+BeginForeignModify(ModifyTableState *mtstate,
+                   ResultRelInfo *rinfo,
+                   List *fdw_private,
+                   int subplan_index,
+                   int eflags);
+```
+
+Initializes write operations. Store per-operation state in `rinfo->ri_FdwState`.
+
+### ExecForeignInsert
+
+```c
+TupleTableSlot *
+ExecForeignInsert(EState *estate,
+                  ResultRelInfo *rinfo,
+                  TupleTableSlot *slot,
+                  TupleTableSlot *planSlot);
+```
+
+Inserts one row into the foreign table. `slot` contains the tuple to insert. Returns a slot with the actually inserted data (for `RETURNING` clause support), or NULL if no row was inserted (e.g., due to triggers).
+
+### ExecForeignUpdate
+
+```c
+TupleTableSlot *
+ExecForeignUpdate(EState *estate,
+                  ResultRelInfo *rinfo,
+                  TupleTableSlot *slot,
+                  TupleTableSlot *planSlot);
+```
+
+Updates one row. `planSlot` contains both the new column values and any junk columns (e.g., row identifiers) added by `AddForeignUpdateTargets`. Use the junk columns to identify which row to update.
+
+### ExecForeignDelete
+
+```c
+TupleTableSlot *
+ExecForeignDelete(EState *estate,
+                  ResultRelInfo *rinfo,
+                  TupleTableSlot *slot,
+                  TupleTableSlot *planSlot);
+```
+
+Deletes one row. The row to delete is identified by junk columns in `planSlot` from `AddForeignUpdateTargets`.
+
+### EndForeignModify
+
+```c
+void
+EndForeignModify(EState *estate, ResultRelInfo *rinfo);
+```
+
+Cleans up after all inserts/updates/deletes. Close prepared statements on the remote server, etc.
+
+## SQL commands for FDW objects
+
+### CREATE FOREIGN DATA WRAPPER
+
+Registers the FDW. The `HANDLER` function returns the `FdwRoutine`; the optional `VALIDATOR` function checks OPTIONS clauses:
+
+```sql
+CREATE FOREIGN DATA WRAPPER myfdw
+    HANDLER my_fdw_handler
+    VALIDATOR my_fdw_validator;
+```
+
+### CREATE SERVER
+
+Defines a remote server instance that uses the FDW. OPTIONS are passed to the FDW's validator and available at runtime:
+
+```sql
+CREATE SERVER myserver
+    FOREIGN DATA WRAPPER myfdw
+    OPTIONS (host 'db.example.com', port '5432', dbname 'remotedb');
+```
+
+### CREATE USER MAPPING
+
+Maps a local PostgreSQL role to credentials on the remote server:
+
+```sql
+CREATE USER MAPPING FOR current_user
+    SERVER myserver
+    OPTIONS (user 'remoteuser', password 'secret');
+```
+
+### CREATE FOREIGN TABLE
+
+Defines the foreign table. Column names and types must match the remote source:
+
+```sql
+CREATE FOREIGN TABLE remote_orders (
+    id        integer NOT NULL,
+    customer  text,
+    amount    numeric,
+    created   timestamp
+)
+SERVER myserver
+OPTIONS (schema_name 'public', table_name 'orders');
+```
+
+### IMPORT FOREIGN SCHEMA
+
+Automatically creates foreign table definitions by introspecting the remote schema. Requires `ImportForeignSchema` to be implemented:
+
+```sql
+IMPORT FOREIGN SCHEMA public
+    LIMIT TO (orders, customers)
+    FROM SERVER myserver
+    INTO local_schema;
+```
+
+## postgres_fdw example
+
+`postgres_fdw` connects to another PostgreSQL instance. It ships with PostgreSQL in `contrib/postgres_fdw/`.
+
+```sql
+CREATE EXTENSION postgres_fdw;
+
+CREATE SERVER remote_pg
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'remote.example.com', port '5432', dbname 'mydb');
+
+CREATE USER MAPPING FOR current_user
+    SERVER remote_pg
+    OPTIONS (user 'replica_user', password 'secret');
+
+-- Import all tables from the remote public schema
+IMPORT FOREIGN SCHEMA public
+    FROM SERVER remote_pg
+    INTO remote;
+
+-- Query transparently
+SELECT * FROM remote.orders WHERE amount > 1000;
+
+-- postgres_fdw pushes WHERE clauses and JOIN to the remote server
+SELECT o.id, c.name
+FROM remote.orders o
+JOIN remote.customers c ON c.id = o.customer_id
+WHERE o.created > '2024-01-01';
+```
+
+## file_fdw example
+
+`file_fdw` reads CSV or text files through the PostgreSQL COPY protocol. It ships with PostgreSQL in `contrib/file_fdw/`.
+
+```sql
+CREATE EXTENSION file_fdw;
+
+CREATE SERVER file_server FOREIGN DATA WRAPPER file_fdw;
+
+CREATE FOREIGN TABLE pg_log (
+    log_time        timestamp,
+    user_name       text,
+    database_name   text,
+    message         text
+)
+SERVER file_server
+OPTIONS (
+    filename '/var/log/postgresql/postgresql.csv',
+    format 'csv'
+);
+
+SELECT log_time, message
+FROM pg_log
+WHERE message LIKE '%ERROR%'
+ORDER BY log_time DESC
+LIMIT 20;
+```
+
+## FDW validator function
+
+The optional validator checks that OPTIONS clauses contain valid keys and values:
+
+```c
+PG_FUNCTION_INFO_V1(my_fdw_validator);
+
+Datum
+my_fdw_validator(PG_FUNCTION_ARGS)
+{
+    List     *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+    Oid       catalog       = PG_GETARG_OID(1);
+    ListCell *cell;
+
+    foreach(cell, options_list) {
+        DefElem *def = lfirst_node(DefElem, cell);
+
+        if (strcmp(def->defname, "host") == 0 ||
+            strcmp(def->defname, "port") == 0 ||
+            strcmp(def->defname, "dbname") == 0)
+            continue;  /* valid option */
+
+        ereport(ERROR,
+                (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                 errmsg("invalid option \"\%s\"", def->defname)));
+    }
+
+    PG_RETURN_VOID();
+}
+```
+
+Register the validator alongside the handler:
+
+```sql
+CREATE FOREIGN DATA WRAPPER myfdw
+    HANDLER my_fdw_handler
+    VALIDATOR my_fdw_validator;
+```

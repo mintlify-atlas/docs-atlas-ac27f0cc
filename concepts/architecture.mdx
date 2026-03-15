@@ -1,0 +1,166 @@
+---
+title: "Architecture"
+description: "PostgreSQL's process model, shared memory layout, background processes, and the complete lifecycle of a query from connection to result."
+---
+
+PostgreSQL uses a **process-per-connection** client/server architecture. Understanding how these processes interact with shared memory and with each other is foundational to diagnosing performance issues, configuring the server, and understanding query behavior.
+
+## The process model
+
+PostgreSQL implements a "process per user" client/server model. Every client process connects to exactly one backend process. Because the number of connections is not known in advance, a supervisor process — the **postmaster** — spawns a new backend process for every connection request.
+
+```
+Client application
+       │ TCP/IP or Unix socket
+       ▼
+  Postmaster (postgres)
+       ├── Backend process  ←─ client A
+       ├── Backend process  ←─ client B
+       ├── Background writer
+       ├── WAL writer
+       ├── Checkpointer
+       └── Autovacuum launcher
+             └── Autovacuum worker (per database)
+```
+
+### Postmaster
+
+The postmaster (`src/backend/postmaster/postmaster.c`) is the first process started when PostgreSQL launches. Its responsibilities are:
+
+- **Allocate shared memory and semaphores** at startup
+- **Listen for incoming connections** on configured TCP/IP ports and Unix sockets
+- **Fork backend processes** for each new connection
+- **Monitor child processes** and reset shared memory if a backend crashes
+- **Coordinate shutdown** by sending signals to children
+
+The postmaster creates shared memory data structures for the backends, but as a rule does not touch them itself. In particular, it is not a member of the `PGPROC` array and cannot participate in lock-manager operations. Keeping the postmaster away from shared memory makes it simpler and more reliable — it can almost always recover from crashes of individual backends by resetting shared memory.
+
+<Note>
+  When a connection is requested, the postmaster forks immediately. The child process performs authentication, then becomes a backend if successful. This ensures that blockages in non-multithreaded libraries like SSL or PAM cannot cause denial of service to other clients.
+</Note>
+
+### Backend processes
+
+Each backend process handles exactly one client connection for its entire lifetime. The backend:
+
+- Receives the query from the client as plain text (no parsing is done client-side)
+- Parses, rewrites, plans, and executes the query
+- Returns rows to the client over the established connection
+- Exits when the client disconnects
+
+Backend processes communicate with each other and with background processes using **semaphores** and **shared memory** to ensure data integrity under concurrent access.
+
+### Background writer (bgwriter)
+
+The background writer (`src/backend/postmaster/bgwriter.c`) was introduced in PostgreSQL 8.0. Its goal is to keep regular backends from having to write out dirty shared buffers when they need to free a buffer slot to read in another page.
+
+> In the best scenario all writes from shared buffers will be issued by the background writer process. However, regular backends are still empowered to issue writes if the bgwriter fails to maintain enough clean shared buffers.
+
+The bgwriter runs on a configurable cycle (`bgwriter_delay`, default 200 ms) and writes dirty buffers up to `bgwriter_lru_maxpages` per cycle. As of PostgreSQL 9.2, the bgwriter no longer handles checkpoints — that responsibility moved to the dedicated **checkpointer** process.
+
+### WAL writer
+
+The WAL writer (`src/backend/postmaster/walwriter.c`) was introduced in PostgreSQL 8.3. It attempts to keep regular backends from having to write and fsync WAL pages. It also guarantees that asynchronously committed transactions reach disk within a bounded time — at most three times the `wal_writer_delay` cycle (default 200 ms).
+
+Regular backends remain empowered to write WAL themselves if the WAL writer does not keep up, so the WAL writer is not an essential process and can shut down quickly when requested.
+
+### Checkpointer
+
+The checkpointer performs periodic checkpoints — points at which all dirty shared buffers and WAL records are guaranteed to be flushed to disk. After a checkpoint, crash recovery can start from that point rather than replaying the entire WAL history. The checkpointer is separate from the bgwriter as of PostgreSQL 9.2.
+
+### Autovacuum
+
+The autovacuum system (`src/backend/postmaster/autovacuum.c`) is structured in two kinds of processes:
+
+- **Autovacuum launcher**: An always-running process started by the postmaster when the `autovacuum` GUC parameter is set. It schedules autovacuum workers at appropriate times.
+- **Autovacuum workers**: Processes that execute the actual vacuuming. Each worker connects to a database, examines the catalogs to select tables needing vacuuming, and runs VACUUM or ANALYZE as needed.
+
+The launcher cannot start workers directly — it signals the postmaster, which forks a new worker. This keeps the launcher isolated from the robustness issues that come with directly spawning processes. Multiple workers can run concurrently in the same database, and they coordinate via shared memory to avoid vacuuming the same table simultaneously.
+
+## Shared memory
+
+At startup, the postmaster allocates a large shared memory segment that all backend and background processes attach to. This segment contains:
+
+- **Shared buffer pool** — the main cache for heap and index pages (`shared_buffers`)
+- **WAL buffers** — write-ahead log records pending flush to disk (`wal_buffers`)
+- **Lock tables** — data structures tracking all held and pending locks
+- **Process array (`PGPROC`)** — per-process state including transaction IDs, snapshot information, and latch structures
+- **Commit log (CLOG)** — in-memory cache of transaction commit/abort status
+- **Miscellaneous caches** — statistics, free space map, visibility map
+
+Processes communicate using the shared memory region and POSIX semaphores (or System V semaphores on older platforms). Lightweight locks (`LWLock`) protect in-memory data structures; heavyweight locks protect database objects like tables and rows across transactions.
+
+## The query lifecycle
+
+This section walks through all the stages a query passes through from the moment the client sends it to the moment the results are returned. This description is based on `src/backend/postmaster/postmaster.c` and the internals chapter of the PostgreSQL documentation.
+
+<Steps>
+  <Step title="Connection establishment">
+    The client establishes a TCP/IP or Unix-socket connection to the postmaster's listening port. The postmaster forks a new backend process. The child authenticates the client (using the rules in `pg_hba.conf`) and, on success, becomes a dedicated backend for this connection.
+  </Step>
+
+  <Step title="Parser stage">
+    The backend receives the query as plain text. The **lexer** (`scan.l`, built with flex) tokenizes the input, and the **parser** (`gram.y`, built with bison) validates syntax and builds a raw **parse tree**.
+
+    Because system catalog lookups can only be done inside a transaction, raw parsing is intentionally limited to syntactic checks. This allows transaction control commands (`BEGIN`, `ROLLBACK`, etc.) to be identified and executed without catalog access.
+
+    The **transformation process** then takes the raw parse tree, opens a transaction if needed, and performs semantic analysis: resolving table and column names against the system catalogs, checking data types, resolving function overloads, and building a **query tree** (`Query` node) that captures the full semantic meaning of the statement.
+  </Step>
+
+  <Step title="Rewrite system">
+    The rewrite system takes the query tree and looks for applicable **rules** stored in the system catalogs. Views are implemented entirely as rules: when a query targets a view, the rewrite system replaces it with an equivalent query against the base tables defined in the view definition.
+
+    Both the input and the output of the rewriter are query trees; rewriting can be thought of as macro expansion.
+  </Step>
+
+  <Step title="Planner / optimizer">
+    The planner/optimizer takes the (possibly rewritten) query tree and produces an **execution plan**.
+
+    For each relation in the query, the planner generates candidate scan paths:
+    - Sequential scan (always available)
+    - B-tree index scan (if a matching index and operator class exist)
+    - Bitmap index scan
+    - Index-only scan
+
+    For multi-relation queries, the planner then considers all feasible join orders and strategies:
+
+    | Join strategy | Description |
+    |---|---|
+    | Nested loop | Scan the right relation once per row in the left relation. Best when the right side can use an index. |
+    | Merge join | Sort both relations on the join key, then scan in parallel. Each relation is scanned only once. |
+    | Hash join | Build a hash table from the right relation, then probe it for each row of the left. |
+
+    For queries joining fewer than `geqo_threshold` relations (default 12), the planner conducts a near-exhaustive search. For larger queries, the **Genetic Query Optimizer (GEQO)** uses heuristics to find a reasonable plan in bounded time.
+
+    The planner estimates the cost of each plan path using statistics gathered by `ANALYZE` (stored in `pg_statistic`) and selects the cheapest path. It then expands that path into a full **plan tree** for the executor.
+  </Step>
+
+  <Step title="Executor">
+    The executor takes the plan tree and processes it recursively using a **demand-pull pipeline** (also called a Volcano or iterator model). Each plan node, when called, delivers one more row or signals that it is exhausted.
+
+    For example, a `MergeJoin` node calls its left and right subtree nodes to obtain rows, compares them, and emits joined rows. A `SeqScan` node at a leaf reads pages from the buffer pool and returns heap tuples one at a time.
+
+    The executor handles all five basic SQL statement types:
+
+    - `SELECT`: rows flow up the plan tree and are sent to the client
+    - `INSERT ... SELECT`: rows flow into a `ModifyTable` node that performs heap inserts
+    - `UPDATE`: the plan includes TIDs of old rows; `ModifyTable` creates new row versions and marks old ones deleted
+    - `DELETE`: only TIDs are needed; `ModifyTable` marks rows deleted
+    - `MERGE`: `ModifyTable` evaluates `WHEN` clauses and inserts, updates, or deletes accordingly
+  </Step>
+</Steps>
+
+## Key configuration parameters
+
+These parameters most directly affect the architectural components described above:
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| `max_connections` | 100 | Maximum number of concurrent client connections (and thus backend processes) |
+| `shared_buffers` | 128 MB | Size of the shared buffer pool; typically set to 25% of total RAM |
+| `wal_buffers` | auto | Size of WAL buffer in shared memory |
+| `bgwriter_delay` | 200 ms | Sleep interval between bgwriter rounds |
+| `wal_writer_delay` | 200 ms | Sleep interval between WAL writer flushes |
+| `checkpoint_timeout` | 5 min | Maximum time between automatic checkpoints |
+| `autovacuum` | on | Whether to run the autovacuum launcher |
+| `autovacuum_max_workers` | 3 | Maximum number of concurrent autovacuum workers |

@@ -1,0 +1,325 @@
+---
+title: psql
+description: The PostgreSQL interactive terminal for running queries, executing scripts, and inspecting database objects.
+---
+
+`psql` is the PostgreSQL interactive terminal. It lets you type SQL queries, execute them against a PostgreSQL server, and see the results. It also provides a set of meta-commands (backslash commands) to list objects, change settings, and manage sessions.
+
+## Connecting to a database
+
+### Command-line flags
+
+```bash
+psql -h hostname -p port -U username -d dbname
+```
+
+| Flag | Long form | Description |
+|------|-----------|-------------|
+| `-h` | `--host` | Database server host or socket directory |
+| `-p` | `--port` | Database server port (default: 5432) |
+| `-U` | `--username` | Database user name |
+| `-d` | `--dbname` | Database name to connect to |
+| `-w` | `--no-password` | Never prompt for password |
+| `-W` | `--password` | Force password prompt |
+
+### Connection string
+
+You can pass a full connection URI as the database name argument:
+
+```bash
+psql "postgresql://alice@localhost:5432/mydb"
+psql "postgresql://alice:secret@db.example.com/mydb?sslmode=require"
+```
+
+### Connect to a local socket
+
+```bash
+# Uses /var/run/postgresql by default
+psql -U postgres
+
+# Specify a socket directory explicitly
+psql -h /tmp -U postgres mydb
+```
+
+## Running a single command and exiting
+
+Use `-c` to run a single SQL statement or meta-command without entering the interactive shell:
+
+```bash
+psql -U postgres -c "SELECT version();"
+psql -U postgres -d mydb -c "\dt"
+```
+
+Use `-f` to execute commands from a file and exit:
+
+```bash
+psql -U postgres -d mydb -f /path/to/script.sql
+```
+
+To execute multiple scripts as a single transaction:
+
+```bash
+psql -1 -U postgres -d mydb -f migration.sql
+```
+
+## Meta-commands
+
+Meta-commands begin with a backslash and are processed by `psql` itself rather than sent to the server.
+
+### Listing database objects
+
+| Command | Description |
+|---------|-------------|
+| `\l` | List all databases |
+| `\c dbname` | Connect to a different database |
+| `\dt` | List tables in the current schema |
+| `\dt schema.*` | List tables in a specific schema |
+| `\d tablename` | Describe a table (columns, indexes, constraints) |
+| `\d+ tablename` | Describe a table with additional detail |
+| `\df` | List functions |
+| `\df funcname` | List functions matching a pattern |
+| `\du` | List roles (users) |
+| `\dn` | List schemas |
+| `\di` | List indexes |
+| `\dv` | List views |
+| `\dm` | List materialized views |
+| `\dx` | List installed extensions |
+| `\ds` | List sequences |
+
+<Tip>
+Append `+` to most `\d` commands for extra detail, and `S` to include system objects. For example, `\dtS+` lists all tables including system tables with full detail.
+</Tip>
+
+### Query execution
+
+| Command | Description |
+|---------|-------------|
+| `\g [FILE]` | Execute the current query buffer (equivalent to `;`), optionally writing results to a file |
+| `\gx [FILE]` | Execute the query and force expanded output |
+| `\gset [PREFIX]` | Execute query and store results as psql variables |
+| `\gexec` | Execute the query, then execute each value in its result |
+| `\watch [i=SEC] [c=N]` | Re-execute the query every SEC seconds, up to N times |
+| `\e [FILE]` | Open the query buffer in an external editor |
+| `\p` | Print the current query buffer |
+| `\r` | Reset (clear) the query buffer |
+
+### Formatting output
+
+| Command | Description |
+|---------|-------------|
+| `\x [on\|off\|auto]` | Toggle expanded (vertical) output mode |
+| `\H` | Toggle HTML output mode |
+| `\t [on\|off]` | Show only rows (tuples only), no column headers or row counts |
+| `\a` | Toggle between aligned and unaligned output |
+| `\pset NAME [VALUE]` | Set a printing option |
+| `\f [STRING]` | Show or set the field separator for unaligned output |
+| `\C [STRING]` | Set the table title |
+
+Common `\pset` options:
+
+```sql
+-- Show NULL values as the string 'NULL'
+\pset null 'NULL'
+
+-- Use a border style (0=none, 1=inner lines, 2=full box)
+\pset border 2
+
+-- Use unicode line drawing
+\pset linestyle unicode
+```
+
+### Input/output
+
+| Command | Description |
+|---------|-------------|
+| `\i FILE` | Execute commands from a file |
+| `\ir FILE` | Execute from a file, relative to the current script's location |
+| `\o [FILE]` | Send all query results to a file or pipe |
+| `\copy ...` | Run a client-side COPY to/from the local filesystem |
+| `\echo STRING` | Write a string to standard output |
+| `\qecho STRING` | Write a string to the `\o` output stream |
+
+### Connection management
+
+| Command | Description |
+|---------|-------------|
+| `\c [DBNAME [USER [HOST [PORT]]]]` | Connect to a new database |
+| `\conninfo` | Show current connection information |
+| `\encoding [ENCODING]` | Show or set the client encoding |
+| `\password [USERNAME]` | Securely change a user's password |
+
+### Timing
+
+```sql
+\timing on
+SELECT count(*) FROM orders;
+-- Time: 12.543 ms
+```
+
+### Variables
+
+```sql
+-- Set a variable
+\set schema_name public
+
+-- Use it in a query
+SELECT * FROM :schema_name.users;
+
+-- Unset a variable
+\unset schema_name
+
+-- Prompt the user to set a variable interactively
+\prompt 'Enter table name: ' tname
+```
+
+## Common workflows
+
+<Tabs>
+  <Tab title="Explore a database">
+```sql
+-- List all databases
+\l
+
+-- Connect to a database
+\c mydb
+
+-- List tables
+\dt
+
+-- Describe a table
+\d users
+
+-- List indexes
+\di
+
+-- Show function definitions
+\sf my_function
+```
+  </Tab>
+  <Tab title="Export query results">
+```sql
+-- Write output to a CSV file
+\copy (SELECT id, name, email FROM users) TO '/tmp/users.csv' CSV HEADER
+
+-- Or redirect all output to a file
+\o /tmp/results.txt
+SELECT * FROM orders WHERE status = 'open';
+\o
+```
+  </Tab>
+  <Tab title="Watch a live query">
+```sql
+-- Re-run every 2 seconds
+\watch i=2
+SELECT count(*), status FROM jobs GROUP BY status;
+```
+  </Tab>
+</Tabs>
+
+## Readline history
+
+By default, `psql` stores command history in `~/.psql_history`. You can control this with these variables:
+
+| Variable | Description |
+|----------|-------------|
+| `HISTFILE` | Path to the history file |
+| `HISTSIZE` | Maximum number of commands to store (default: 500) |
+| `HISTCONTROL` | Controls history deduplication: `ignorespace`, `ignoredups`, `ignoreboth` |
+
+```sql
+-- Ignore duplicate commands in history
+\set HISTCONTROL ignoredups
+
+-- Show or save history
+\s
+\s /tmp/my_history.sql
+```
+
+## The .psqlrc configuration file
+
+On startup, `psql` reads a system-wide `psqlrc` file and then your personal `~/.psqlrc` (or `%APPDATA%\postgresql\psqlrc.conf` on Windows). Use it to set defaults for every session:
+
+```sql
+-- ~/.psqlrc
+
+-- Always show query timing
+\timing on
+
+-- Expand output automatically for wide results
+\x auto
+
+-- Show NULLs visibly
+\pset null '∅'
+
+-- Set a custom prompt showing user, host, and database
+\set PROMPT1 '%n@%m:%>/%/ %R%# '
+
+-- Ignore duplicate history entries
+\set HISTCONTROL ignoredups
+
+-- Store 2000 history entries
+\set HISTSIZE 2000
+
+-- Stop on first error when reading from a file
+\set ON_ERROR_STOP on
+```
+
+Use `-X` or `--no-psqlrc` to skip loading the file.
+
+## Password authentication
+
+<Warning>
+Avoid setting `PGPASSWORD` in shell scripts that may be logged or appear in process listings. Use a `.pgpass` file or a connection service file instead.
+</Warning>
+
+### Environment variable
+
+```bash
+PGPASSWORD=secret psql -U alice -d mydb
+```
+
+### .pgpass file
+
+Create `~/.pgpass` (mode 0600) with lines in the format:
+
+```
+hostname:port:database:username:password
+```
+
+Examples:
+
+```
+localhost:5432:mydb:alice:secret
+db.example.com:5432:*:deploy:deploy_password
+*:*:*:postgres:admin_password
+```
+
+```bash
+chmod 0600 ~/.pgpass
+```
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `PGHOST` | Default host |
+| `PGPORT` | Default port |
+| `PGUSER` | Default user |
+| `PGDATABASE` | Default database |
+| `PGPASSWORD` | Password (not recommended for scripts) |
+| `PGPASSFILE` | Path to password file (default: `~/.pgpass`) |
+| `PSQLRC` | Alternative location for `.psqlrc` |
+| `PSQL_HISTORY` | Alternative location for history file |
+| `PSQL_EDITOR` | Editor used by `\e`, `\ef`, `\ev` |
+| `PSQL_PAGER` | Pager program for output |
+
+## Output format options
+
+| Flag | Description |
+|------|-------------|
+| `-A` / `--no-align` | Unaligned table output mode |
+| `--csv` | CSV output mode |
+| `-x` / `--expanded` | Expanded table output |
+| `-H` / `--html` | HTML table output mode |
+| `-t` / `--tuples-only` | Print rows only, no headers |
+| `-F STRING` | Set field separator for unaligned output |

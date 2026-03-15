@@ -1,0 +1,222 @@
+---
+title: 'Range types'
+description: 'Built-in range types (int4range, int8range, numrange, tsrange, tstzrange, daterange), range operators, multirange types, exclusion constraints with ranges, and creating custom range types in PostgreSQL.'
+---
+
+Range types represent a range of values of some subtype. They make it easy to express concepts like "all integers from 1 to 10", "all timestamps during a meeting", or "prices between $5 and $20".
+
+## Built-in range types
+
+| Range type | Subtype | Multirange type |
+|---|---|---|
+| `int4range` | `integer` | `int4multirange` |
+| `int8range` | `bigint` | `int8multirange` |
+| `numrange` | `numeric` | `nummultirange` |
+| `tsrange` | `timestamp without time zone` | `tsmultirange` |
+| `tstzrange` | `timestamp with time zone` | `tstzmultirange` |
+| `daterange` | `date` | `datemultirange` |
+
+## Range literal syntax
+
+Bounds use `[` (inclusive) or `(` (exclusive).
+
+```sql
+-- Includes 3, excludes 7
+SELECT '[3,7)'::int4range;
+
+-- Excludes both bounds
+SELECT '(3,7)'::int4range;
+
+-- Single point: [4,4]
+SELECT '[4,4]'::int4range;
+
+-- Empty range (no points)
+SELECT '[4,4)'::int4range;  -- normalized to 'empty'
+
+-- Unbounded lower: all values less than 7
+SELECT '(,7)'::int4range;
+
+-- Unbounded upper
+SELECT '[3,)'::int4range;
+```
+
+For discrete types (`int4range`, `int8range`, `daterange`), ranges are automatically canonicalized to `[lower, upper)` form.
+
+## Constructor functions
+
+Each range type has a constructor function with the same name.
+
+```sql
+-- Two-argument form: lower-inclusive, upper-exclusive
+SELECT int4range(1, 10);           -- [1,10)
+SELECT daterange('2024-01-01', '2024-02-01');  -- [2024-01-01,2024-02-01)
+
+-- Three-argument form: specify inclusivity
+SELECT numrange(1.0, 14.0, '(]'); -- (1.0,14.0]
+SELECT numrange(1.0, 14.0, '[]'); -- [1.0,14.0]
+```
+
+## Range operators
+
+```sql
+-- Containment: does the range contain the element?
+SELECT int4range(10, 20) @> 15;   -- true
+SELECT int4range(10, 20) @> 20;   -- false (upper bound is exclusive)
+
+-- Contained by
+SELECT 15 <@ int4range(10, 20);   -- true
+
+-- Overlap
+SELECT numrange(11.1, 22.2) && numrange(20.0, 30.0);  -- true
+
+-- Strictly left of
+SELECT int4range(1, 10) << int4range(15, 20);  -- true
+
+-- Strictly right of
+SELECT int4range(15, 20) >> int4range(1, 10);  -- true
+
+-- Does not extend to the right of
+SELECT int4range(1, 20) &< int4range(18, 25);  -- true
+
+-- Does not extend to the left of
+SELECT int4range(7, 20) &> int4range(5, 10);   -- true
+
+-- Adjacent (no gap, no overlap)
+SELECT int4range(1, 10) -|- int4range(10, 20); -- true
+
+-- Union
+SELECT int4range(1, 5) + int4range(4, 10);  -- [1,10)
+
+-- Intersection
+SELECT int4range(1, 15) * int4range(10, 25); -- [10,15)
+
+-- Difference
+SELECT int4range(1, 15) - int4range(10, 25); -- [1,10)
+```
+
+## Range functions
+
+```sql
+-- Extract bounds
+SELECT lower(int8range(15, 25));      -- 15
+SELECT upper(int8range(15, 25));      -- 25
+
+-- Inclusivity
+SELECT lower_inc('[3,7)'::int4range);  -- true
+SELECT upper_inc('[3,7)'::int4range);  -- false
+
+-- Infinite bounds
+SELECT lower_inf('(,5)'::int4range);  -- true
+SELECT upper_inf('[3,)'::int4range);  -- true
+
+-- Is the range empty?
+SELECT isempty('empty'::int4range);  -- true
+SELECT isempty(numrange(1, 5));       -- false
+```
+
+## Practical example: meeting room reservations
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE reservations (
+    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    room_no  integer NOT NULL,
+    during   tstzrange NOT NULL,
+    EXCLUDE USING gist (room_no WITH =, during WITH &&)
+);
+
+-- This succeeds
+INSERT INTO reservations (room_no, during) VALUES
+    (101, '[2024-06-15 09:00+00, 2024-06-15 10:00+00)');
+
+-- This fails: overlaps with the existing booking
+INSERT INTO reservations (room_no, during) VALUES
+    (101, '[2024-06-15 09:30+00, 2024-06-15 11:00+00)');
+-- ERROR: conflicting key value violates exclusion constraint
+
+-- Find rooms available at a given time
+SELECT DISTINCT room_no
+FROM all_rooms
+WHERE room_no NOT IN (
+    SELECT room_no FROM reservations
+    WHERE during && '[2024-06-15 14:00+00, 2024-06-15 15:00+00)'::tstzrange
+);
+```
+
+## Multirange types
+
+A multirange is an ordered list of non-overlapping, non-empty ranges of the same subtype. Every range type has a corresponding multirange type.
+
+```sql
+-- Multirange literals
+SELECT '{}'::int4multirange;               -- empty multirange
+SELECT '{[3,7)}'::int4multirange;         -- single range
+SELECT '{[3,7), [8,9)}'::int4multirange; -- two ranges
+
+-- Multirange from ranges
+SELECT int4multirange(int4range(1,5), int4range(10,20));
+
+-- Multirange operators
+SELECT '{[3,7), [8,12)}'::int4multirange @> 5;    -- true
+SELECT '{[3,7)}'::int4multirange && '{[5,10)}'::int4multirange;  -- true
+
+-- Union two multiranges
+SELECT '{[1,5)}'::int4multirange + '{[3,8)}'::int4multirange;   -- {[1,8)}
+```
+
+## Indexes on range types
+
+```sql
+-- GiST index: supports all range operators
+CREATE INDEX idx_reservations_during ON reservations USING GIST (during);
+
+-- SP-GiST: also available for some range types
+CREATE INDEX idx_reservations_spgist ON reservations USING SPGIST (during);
+
+-- BRIN: useful for naturally ordered ranges (e.g., time series)
+CREATE INDEX idx_log_interval ON log_ranges USING BRIN (recorded_during);
+```
+
+## Creating custom range types
+
+You can create range types over any type that has a total ordering.
+
+```sql
+-- Create a range type for float8
+CREATE TYPE float8range AS RANGE (
+    subtype = float8,
+    subtype_diff = float8mi
+);
+
+SELECT float8range(1.5, 3.0) @> 2.0;  -- true
+
+-- Range type with custom subtype using a canonical function
+CREATE TYPE posint AS RANGE (
+    subtype = integer,
+    subtype_diff = int4mi
+);
+```
+
+## Temporal tables with ranges
+
+Range types are well-suited for modeling application time in temporal tables:
+
+```sql
+CREATE TABLE product_prices (
+    product_no  integer,
+    price       numeric,
+    valid_at    daterange,
+    EXCLUDE USING gist (product_no WITH =, valid_at WITH &&)
+);
+
+INSERT INTO product_prices VALUES
+    (5, 5.00, '[2020-01-01,2022-01-01)'),
+    (5, 8.00, '[2022-01-01,)'),          -- open upper bound = indefinitely
+    (6, 9.00, '[2021-01-01,2024-01-01)');
+
+-- Price of product 5 on a given date
+SELECT price FROM product_prices
+WHERE product_no = 5
+  AND valid_at @> '2023-06-15'::date;
+```

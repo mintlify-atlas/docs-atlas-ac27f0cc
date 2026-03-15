@@ -1,0 +1,210 @@
+---
+title: pg_trgm
+description: Fuzzy string matching and similarity search using trigram indexes in PostgreSQL.
+---
+
+The `pg_trgm` module provides functions and operators for determining the similarity of text using trigram matching, as well as GIN and GiST index operator classes that support fast similarity searches and accelerate `LIKE`, `ILIKE`, and regular expression queries.
+
+## What is a trigram?
+
+A trigram is a group of three consecutive characters taken from a string. `pg_trgm` measures similarity between two strings by counting their shared trigrams.
+
+For example, the set of trigrams for `cat` is: `" c"`, `" ca"`, `"cat"`, `"at "`
+
+`pg_trgm` ignores non-alphanumeric characters and treats each word as having two leading spaces and one trailing space.
+
+## Installation
+
+`pg_trgm` is a trusted extension — it can be installed by any user with `CREATE` privilege on the database:
+
+```sql
+CREATE EXTENSION pg_trgm;
+```
+
+## Functions
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `similarity(text, text)` | real | Returns a number from 0 (completely dissimilar) to 1 (identical) indicating how similar the two strings are |
+| `word_similarity(text, text)` | real | Returns the greatest similarity between the first string and any continuous extent of trigrams in the second string |
+| `strict_word_similarity(text, text)` | real | Like `word_similarity`, but only considers extents that match word boundaries |
+| `show_trgm(text)` | text[] | Returns an array of all trigrams in the string (useful for debugging) |
+| `show_limit()` | real | Returns the current similarity threshold for the `%` operator (deprecated; use `SHOW pg_trgm.similarity_threshold`) |
+| `set_limit(real)` | real | Sets the current similarity threshold (deprecated; use `SET pg_trgm.similarity_threshold`) |
+
+### Examples
+
+```sql
+SELECT similarity('word', 'sword');
+-- 0.5
+
+SELECT similarity('word', 'words');
+-- 0.571429
+
+SELECT word_similarity('word', 'two words');
+-- 0.8
+
+SELECT strict_word_similarity('word', 'two words');
+-- 0.571429
+
+SELECT show_trgm('cat');
+-- {" c"," ca","at ",cat}
+```
+
+## Operators
+
+| Operator | Returns | Description |
+|----------|---------|-------------|
+| `text % text` | boolean | Returns true if the similarity is above `pg_trgm.similarity_threshold` (default 0.3) |
+| `text <% text` | boolean | Returns true if `word_similarity` exceeds `pg_trgm.word_similarity_threshold` (default 0.6) |
+| `text %> text` | boolean | Commutator of `<%` |
+| `text <<% text` | boolean | Returns true if `strict_word_similarity` exceeds `pg_trgm.strict_word_similarity_threshold` (default 0.5) |
+| `text %>> text` | boolean | Commutator of `<<%` |
+| `text <-> text` | real | Distance: `1 - similarity()` |
+| `text <<-> text` | real | Distance: `1 - word_similarity()` |
+| `text <->> text` | real | Commutator of `<<->` |
+| `text <<<-> text` | real | Distance: `1 - strict_word_similarity()` |
+| `text <->>> text` | real | Commutator of `<<<->` |
+
+```sql
+-- Are these similar (above default 0.3 threshold)?
+SELECT 'hello' % 'helo';
+-- t
+
+-- Distance (lower is more similar)
+SELECT 'hello' <-> 'world';
+-- 1
+
+SELECT 'hello' <-> 'helo';
+-- 0.25
+```
+
+## GUC parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pg_trgm.similarity_threshold` | 0.3 | Minimum similarity for the `%` operator. Range 0–1. |
+| `pg_trgm.word_similarity_threshold` | 0.6 | Minimum word similarity for the `<%` and `%>` operators. Range 0–1. |
+| `pg_trgm.strict_word_similarity_threshold` | 0.5 | Minimum strict word similarity for `<<%` and `%>>` operators. Range 0–1. |
+
+```sql
+-- Lower the threshold to match more loosely
+SET pg_trgm.similarity_threshold = 0.2;
+
+-- Or set persistently in postgresql.conf
+-- pg_trgm.similarity_threshold = 0.3
+```
+
+## Index support
+
+`pg_trgm` provides GIN and GiST index operator classes that support:
+
+- Similarity operators (`%`, `<%`, `<<%`, and their distance variants)
+- `LIKE` and `ILIKE` queries
+- Regular expression matches (`~` and `~*`)
+
+```sql
+CREATE TABLE products (name text);
+
+-- GIN index (better for exact lookups and LIKE/regex)
+CREATE INDEX products_name_gin ON products USING GIN (name gin_trgm_ops);
+
+-- GiST index (better for distance/nearest-neighbor ORDER BY queries)
+CREATE INDEX products_name_gist ON products USING GIST (name gist_trgm_ops);
+
+-- GiST with explicit signature length (default 12 bytes, range 1-2024)
+CREATE INDEX products_name_gist ON products USING GIST (name gist_trgm_ops(siglen=32));
+```
+
+<Tip>
+Use GIN indexes for `LIKE`/`ILIKE`/regex searches and similarity operator filtering. Use GiST indexes when you need `ORDER BY similarity` or nearest-neighbor queries with `LIMIT`, since GiST supports index scans ordered by distance.
+</Tip>
+
+## Similarity search examples
+
+<Tabs>
+  <Tab title="Find similar strings">
+```sql
+CREATE TABLE words (word text);
+INSERT INTO words VALUES ('hello'), ('world'), ('helo'), ('word'), ('postgresql'), ('postgreql');
+
+CREATE INDEX words_trgm ON words USING GIN (word gin_trgm_ops);
+
+-- Find words similar to 'hello'
+SELECT word, similarity(word, 'hello') AS sml
+FROM words
+WHERE word % 'hello'
+ORDER BY sml DESC;
+
+--  word  |   sml
+-- -------+----------
+--  hello | 1
+--  helo  | 0.444444
+```
+  </Tab>
+  <Tab title="Find nearest neighbors (GiST)">
+```sql
+-- 10 closest words to 'postgresl' by trigram distance
+SELECT word, word <-> 'postgresl' AS dist
+FROM words
+ORDER BY dist
+LIMIT 10;
+
+--     word     |   dist
+-- -------------+----------
+--  postgreql   | 0.444444
+--  postgresql  | 0.5
+```
+  </Tab>
+  <Tab title="LIKE with trigram index">
+```sql
+-- This LIKE query will use the GIN trigram index
+SELECT * FROM products
+WHERE name LIKE '%keyboard%';
+
+-- ILIKE also supported
+SELECT * FROM products
+WHERE name ILIKE '%keyboard%';
+```
+  </Tab>
+  <Tab title="Regex with trigram index">
+```sql
+-- Regular expression matching also uses the trigram index
+SELECT * FROM products
+WHERE name ~ '(keyboard|mouse)';
+```
+  </Tab>
+</Tabs>
+
+## Fuzzy search for misspellings
+
+A common pattern is to build a word list table for detecting misspellings in full-text search:
+
+```sql
+-- Build a word list from your documents
+CREATE TABLE words AS
+  SELECT word
+  FROM ts_stat('SELECT to_tsvector(''simple'', description) FROM products');
+
+CREATE INDEX words_trgm ON words USING GIN (word gin_trgm_ops);
+
+-- Find the closest known word to a potentially misspelled input
+SELECT word, similarity(word, 'postgress') AS sml
+FROM words
+WHERE word % 'postgress'
+ORDER BY sml DESC
+LIMIT 5;
+```
+
+## Word similarity search
+
+`word_similarity` is useful when you want to find records where a search term appears as part of a longer string:
+
+```sql
+-- Find products whose name contains something similar to 'key'
+SELECT name, word_similarity('key', name) AS sml
+FROM products
+WHERE 'key' <% name
+ORDER BY sml DESC
+LIMIT 10;
+```

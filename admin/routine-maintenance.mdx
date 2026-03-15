@@ -1,0 +1,241 @@
+---
+title: Routine maintenance
+description: Run VACUUM and ANALYZE to reclaim dead tuple space and update planner statistics, configure autovacuum, use REINDEX and CLUSTER, monitor table bloat with pg_stat_user_tables, and prevent transaction ID wraparound.
+---
+
+PostgreSQL requires periodic maintenance to achieve optimal performance and ensure data integrity. The primary maintenance operations are vacuuming, analyzing, and reindexing.
+
+## Why VACUUM is required
+
+PostgreSQL uses multi-version concurrency control (MVCC). When a row is updated or deleted, the old row version is not immediately removed — it is kept until no transaction can see it. Over time, tables accumulate these **dead row versions** (dead tuples), which:
+
+- Waste disk space
+- Slow down sequential scans
+- Bloat indexes
+- Risk transaction ID wraparound (a data-corruption scenario if ignored)
+
+`VACUUM` reclaims space occupied by dead tuples and marks it available for reuse.
+
+## VACUUM
+
+```sql
+-- Vacuum a specific table
+VACUUM orders;
+
+-- Vacuum with verbose output
+VACUUM VERBOSE orders;
+
+-- Vacuum and analyze in one pass
+VACUUM ANALYZE orders;
+
+-- Vacuum the entire database
+VACUUM;
+```
+
+Standard `VACUUM` runs concurrently with normal operations (`SELECT`, `INSERT`, `UPDATE`, `DELETE`). It marks dead tuple space as reusable but does not return space to the OS (except when pages at the very end of the table become completely empty).
+
+### VACUUM FULL
+
+```sql
+VACUUM FULL orders;
+```
+
+`VACUUM FULL` rewrites the entire table to a new file, physically compacting it and returning space to the OS. However:
+
+- Requires an `ACCESS EXCLUSIVE` lock — the table is unavailable for all other operations.
+- Requires extra disk space equal to the table size during execution.
+- Autovacuum never runs `VACUUM FULL`.
+
+<Warning>
+  Avoid `VACUUM FULL` on large, actively-used tables during business hours. If a table is severely bloated, consider using `pg_repack` as an alternative that runs without exclusive locking.
+</Warning>
+
+## ANALYZE
+
+`ANALYZE` collects statistics about table contents. The query planner uses these statistics to choose optimal execution plans.
+
+```sql
+-- Analyze a specific table
+ANALYZE orders;
+
+-- Analyze a specific column
+ANALYZE orders (customer_id);
+
+-- Analyze all tables in the database
+ANALYZE;
+```
+
+Adjust statistics target per column for tables with skewed or complex data distributions:
+
+```sql
+-- Increase statistics target for a specific column (default is 100)
+ALTER TABLE orders ALTER COLUMN status SET STATISTICS 500;
+ANALYZE orders (status);
+```
+
+## Autovacuum
+
+Autovacuum is a background daemon that automatically issues `VACUUM` and `ANALYZE` based on table activity. It is enabled by default and should remain enabled in production.
+
+### How autovacuum decides when to run
+
+**VACUUM threshold:**
+```
+vacuum_threshold = autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * reltuples
+```
+
+Default: `50 + 0.20 * n_live_tup`. Autovacuum runs VACUUM on a table when the number of dead tuples exceeds this threshold.
+
+**ANALYZE threshold:**
+```
+analyze_threshold = autovacuum_analyze_threshold + autovacuum_analyze_scale_factor * reltuples
+```
+
+Default: `50 + 0.10 * n_live_tup`.
+
+### Key autovacuum parameters
+
+```ini postgresql.conf
+autovacuum = on
+autovacuum_max_workers = 3
+autovacuum_naptime = 1min
+autovacuum_vacuum_threshold = 50
+autovacuum_vacuum_scale_factor = 0.2
+autovacuum_analyze_threshold = 50
+autovacuum_analyze_scale_factor = 0.1
+autovacuum_vacuum_cost_delay = 2ms     # throttle I/O impact
+autovacuum_vacuum_cost_limit = 200
+log_autovacuum_min_duration = 0        # log all autovacuum runs
+```
+
+### Tuning autovacuum per table
+
+For large tables, the default `scale_factor` of 0.2 means autovacuum triggers only after 20% of rows change. Override at the table level:
+
+```sql
+ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_analyze_scale_factor = 0.005,
+  autovacuum_vacuum_threshold = 1000
+);
+```
+
+## Monitoring bloat with pg_stat_user_tables
+
+```sql
+SELECT relname,
+       n_live_tup,
+       n_dead_tup,
+       round(n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0) * 100, 2) AS dead_pct,
+       last_vacuum,
+       last_autovacuum,
+       last_analyze,
+       last_autoanalyze
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY dead_pct DESC;
+```
+
+Estimate table bloat using `pg_relation_size` vs. live tuple estimates:
+
+```sql
+SELECT relname,
+       pg_size_pretty(pg_relation_size(oid)) AS table_size,
+       n_live_tup,
+       n_dead_tup
+FROM pg_stat_user_tables
+JOIN pg_class USING (relname)
+WHERE schemaname = 'public'
+ORDER BY pg_relation_size(pg_class.oid) DESC
+LIMIT 20;
+```
+
+## Transaction ID wraparound prevention
+
+PostgreSQL uses 32-bit transaction IDs (XIDs). After approximately 2 billion transactions, the counter wraps around, which would make old data appear to be from the future — a catastrophic data loss scenario.
+
+`VACUUM` prevents this by **freezing** old row versions, marking them with `FrozenTransactionId` which is always treated as older than any normal XID.
+
+### Monitoring XID age
+
+```sql
+-- Check age of each table (high age = needs vacuum)
+SELECT c.oid::regclass AS table_name,
+       greatest(age(c.relfrozenxid), age(t.relfrozenxid)) AS xid_age
+FROM pg_class c
+LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind IN ('r', 'm')
+ORDER BY xid_age DESC
+LIMIT 20;
+
+-- Check database-wide XID age
+SELECT datname, age(datfrozenxid) AS xid_age
+FROM pg_database
+ORDER BY xid_age DESC;
+```
+
+When age exceeds `autovacuum_freeze_max_age` (default: 200 million), autovacuum performs an aggressive vacuum to freeze old rows, even on tables that would not otherwise need vacuuming.
+
+Related parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `vacuum_freeze_min_age` | 50,000,000 | Freeze rows older than this |
+| `vacuum_freeze_table_age` | 150,000,000 | Force full-table scan when table XID age exceeds this |
+| `autovacuum_freeze_max_age` | 200,000,000 | Force autovacuum when table XID age exceeds this |
+
+<Warning>
+  If XID age approaches 2 billion without vacuuming, PostgreSQL emits warnings and eventually refuses to start new transactions. Monitor XID age and ensure autovacuum is running. If you see `WARNING: database "X" must be vacuumed within N transactions`, run `VACUUM` immediately.
+</Warning>
+
+## REINDEX
+
+Indexes can become bloated or corrupt. `REINDEX` rebuilds them.
+
+```sql
+-- Reindex a single index
+REINDEX INDEX orders_customer_id_idx;
+
+-- Reindex all indexes on a table
+REINDEX TABLE orders;
+
+-- Reindex all indexes in the database
+REINDEX DATABASE mydb;
+
+-- Non-blocking reindex (PostgreSQL 12+)
+REINDEX INDEX CONCURRENTLY orders_customer_id_idx;
+REINDEX TABLE CONCURRENTLY orders;
+```
+
+`REINDEX CONCURRENTLY` builds the new index without locking reads and writes, at the cost of longer execution time.
+
+## CLUSTER
+
+`CLUSTER` physically reorders a table's rows to match the order of a specific index. This improves performance for queries that access rows in index order and reduces I/O for range scans.
+
+```sql
+-- Cluster the orders table on the created_at index
+CLUSTER orders USING orders_created_at_idx;
+
+-- Recluster using the previously specified index
+CLUSTER orders;
+
+-- Cluster all tables that have a recorded cluster index
+CLUSTER;
+```
+
+<Warning>
+  `CLUSTER` requires an `ACCESS EXCLUSIVE` lock and rewrites the entire table. The table is not updated incrementally — rows inserted or updated after clustering will not be in order. Run `CLUSTER` during maintenance windows on large tables.
+</Warning>
+
+## Routine maintenance schedule
+
+A practical maintenance schedule for most production systems:
+
+| Task | Frequency | Notes |
+|------|-----------|-------|
+| Autovacuum | Continuous | Keep enabled; tune thresholds for large tables |
+| Manual `VACUUM ANALYZE` | Weekly or on-demand | Run after large bulk loads or deletions |
+| `REINDEX CONCURRENTLY` | Monthly or when bloat is detected | Check `pg_stat_user_indexes` for bloat |
+| Monitor XID age | Daily | Alert if any database age > 1 billion |
+| `pg_dumpall` backup | Daily | For logical backup and disaster recovery |

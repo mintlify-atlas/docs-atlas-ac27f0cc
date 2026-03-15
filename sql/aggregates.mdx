@@ -1,0 +1,208 @@
+---
+title: 'Aggregates'
+description: 'COUNT, SUM, AVG, MIN, MAX, string_agg, array_agg, jsonb_agg, FILTER, ordered-set aggregates, and hypothetical-set aggregates in PostgreSQL.'
+---
+
+Aggregate functions compute a single result from a set of input rows. They are used with `GROUP BY` or on an entire result set.
+
+## Standard aggregates
+
+```sql
+SELECT
+    COUNT(*)                     AS total_rows,
+    COUNT(price)                 AS non_null_prices,   -- ignores NULLs
+    COUNT(DISTINCT category)     AS unique_categories,
+    SUM(quantity)                AS total_qty,
+    AVG(price)                   AS avg_price,
+    MIN(price)                   AS min_price,
+    MAX(price)                   AS max_price
+FROM products;
+```
+
+```sql
+-- Per-group aggregation
+SELECT
+    category,
+    COUNT(*)       AS cnt,
+    AVG(price)     AS avg_price,
+    SUM(quantity)  AS total_qty
+FROM products
+GROUP BY category
+ORDER BY avg_price DESC;
+```
+
+## String aggregates
+
+`string_agg` concatenates non-null values with a delimiter.
+
+```sql
+SELECT
+    category,
+    string_agg(name, ', ' ORDER BY name) AS product_list
+FROM products
+GROUP BY category;
+```
+
+## Array aggregates
+
+`array_agg` collects values into an array.
+
+```sql
+SELECT
+    customer_id,
+    array_agg(product_no ORDER BY order_date) AS purchased_products
+FROM order_items
+JOIN orders USING (order_id)
+GROUP BY customer_id;
+```
+
+## JSON aggregates
+
+```sql
+-- Aggregate rows into a JSON array
+SELECT
+    category,
+    jsonb_agg(jsonb_build_object('name', name, 'price', price) ORDER BY price) AS products_json
+FROM products
+GROUP BY category;
+
+-- Aggregate key-value pairs into a JSON object
+SELECT
+    jsonb_object_agg(name, price) AS price_map
+FROM products
+WHERE category = 'electronics';
+```
+
+## Boolean aggregates
+
+```sql
+SELECT
+    category,
+    bool_and(in_stock)   AS all_in_stock,   -- true only if every row is true
+    bool_or(on_sale)     AS any_on_sale     -- true if at least one row is true
+FROM products
+GROUP BY category;
+```
+
+## Statistical aggregates
+
+```sql
+SELECT
+    STDDEV(price)      AS price_stddev,
+    VARIANCE(price)    AS price_variance,
+    CORR(price, cost)  AS price_cost_corr
+FROM products;
+```
+
+## FILTER clause
+
+The `FILTER` clause applies a condition to only the rows considered by an aggregate. Rows not matching the filter are excluded from that aggregate but still contribute to the overall query.
+
+```sql
+SELECT
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE status = 'shipped')   AS shipped,
+    COUNT(*) FILTER (WHERE status = 'pending')   AS pending,
+    SUM(total) FILTER (WHERE status = 'shipped') AS shipped_revenue
+FROM orders;
+```
+
+```sql
+-- Per-month active users with a single pass over the table
+SELECT
+    date_trunc('month', created_at) AS month,
+    COUNT(*) FILTER (WHERE plan = 'free')    AS free_signups,
+    COUNT(*) FILTER (WHERE plan = 'paid')    AS paid_signups
+FROM users
+GROUP BY 1
+ORDER BY 1;
+```
+
+## Ordered-set aggregates
+
+Ordered-set aggregates require an explicit `ORDER BY` within the aggregate (not a global `ORDER BY`). They compute statistics that depend on a sorted ordering of the input.
+
+### Percentiles
+
+```sql
+-- Continuous: interpolates between values
+SELECT
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY salary) AS median_salary,
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY salary) AS p95_salary
+FROM employees;
+
+-- Multiple percentiles in one call
+SELECT
+    percentile_cont(ARRAY[0.25, 0.5, 0.75])
+        WITHIN GROUP (ORDER BY response_time_ms) AS quartiles
+FROM api_requests;
+```
+
+```sql
+-- Discrete: returns an actual value from the dataset
+SELECT
+    percentile_disc(0.5) WITHIN GROUP (ORDER BY score) AS median_score
+FROM test_results;
+```
+
+### mode()
+
+Returns the most common value.
+
+```sql
+SELECT mode() WITHIN GROUP (ORDER BY status) AS most_common_status
+FROM orders;
+```
+
+## Hypothetical-set aggregates
+
+Hypothetical-set aggregates compute the rank of a hypothetical value within the sorted order of actual values.
+
+```sql
+-- What rank would a salary of 80000 have?
+SELECT
+    rank(80000) WITHIN GROUP (ORDER BY salary)         AS hypothetical_rank,
+    dense_rank(80000) WITHIN GROUP (ORDER BY salary)   AS hypothetical_dense_rank,
+    percent_rank(80000) WITHIN GROUP (ORDER BY salary) AS hypothetical_pct_rank,
+    cume_dist(80000) WITHIN GROUP (ORDER BY salary)    AS hypothetical_cume_dist
+FROM employees;
+```
+
+## ORDER BY within aggregates
+
+Many aggregates accept an `ORDER BY` clause to control the order in which rows are processed.
+
+```sql
+-- Concatenate values in alphabetical order
+SELECT string_agg(name, ', ' ORDER BY name) FROM products;
+
+-- Accumulate array in insertion order
+SELECT array_agg(event_type ORDER BY created_at) AS event_sequence
+FROM events
+GROUP BY session_id;
+```
+
+## DISTINCT inside aggregates
+
+```sql
+-- Count distinct values only
+SELECT COUNT(DISTINCT customer_id) AS unique_customers FROM orders;
+
+-- Sum only distinct prices
+SELECT SUM(DISTINCT price) FROM products;
+```
+
+## Aggregate with HAVING
+
+```sql
+SELECT
+    customer_id,
+    COUNT(*)       AS order_count,
+    SUM(total)     AS lifetime_value
+FROM orders
+GROUP BY customer_id
+HAVING COUNT(*) >= 5
+   AND SUM(total) > 500
+ORDER BY lifetime_value DESC
+LIMIT 20;
+```

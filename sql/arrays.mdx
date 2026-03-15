@@ -1,0 +1,256 @@
+---
+title: 'Arrays'
+description: 'Array type declarations, array literals, ARRAY constructor, operators (@>, <@, &&, ||), array functions (array_append, array_prepend, array_cat, array_length, unnest, ANY/ALL), and multi-dimensional arrays in PostgreSQL.'
+---
+
+PostgreSQL allows columns to be defined as variable-length multidimensional arrays of any base type, enum type, composite type, range type, or domain.
+
+## Declaring array columns
+
+```sql
+-- Append [] to the base type name
+CREATE TABLE contacts (
+    name            text,
+    phone_numbers   text[],        -- one-dimensional
+    scores          integer[]
+);
+
+-- Two-dimensional array
+CREATE TABLE schedules (
+    name     text,
+    schedule text[][]   -- employee's weekly schedule[day][slot]
+);
+
+-- SQL-standard syntax
+CREATE TABLE tags (
+    id   bigint,
+    vals integer ARRAY       -- equivalent to integer[]
+);
+```
+
+<Note>
+PostgreSQL does not enforce declared dimension counts or size limits on arrays. `integer[3]` and `integer[]` are treated identically at runtime.
+</Note>
+
+## Array literals and the ARRAY constructor
+
+```sql
+-- Literal syntax: curly braces
+INSERT INTO contacts VALUES
+    ('Alice', '{"555-1234","555-5678"}', '{95,87,92}'),
+    ('Bob',   '{"555-9000"}',            '{70,80}');
+
+-- ARRAY constructor: use SQL expressions (including subqueries)
+INSERT INTO contacts VALUES
+    ('Carol',
+     ARRAY['+1-555-0100', '+1-555-0200'],
+     ARRAY[88, 91, 95]);
+
+-- 2D literal
+SELECT '{{1,2,3},{4,5,6},{7,8,9}}'::integer[];
+
+-- 2D ARRAY constructor
+SELECT ARRAY[[1,2],[3,4]];
+```
+
+## Accessing elements and slices
+
+PostgreSQL arrays are 1-based by default.
+
+```sql
+-- Single element
+SELECT phone_numbers[1] FROM contacts WHERE name = 'Alice';
+
+-- Slice: [lower:upper]
+SELECT scores[1:2] FROM contacts WHERE name = 'Alice';
+
+-- 2D slice
+SELECT schedule[1:2][1:1] FROM schedules WHERE name = 'Bob';
+
+-- Omit bounds to use the array's natural bounds
+SELECT schedule[:2][2:] FROM schedules WHERE name = 'Bob';
+
+-- Dimensions
+SELECT array_dims(scores) FROM contacts WHERE name = 'Alice';  -- [1:3]
+SELECT array_length(scores, 1) FROM contacts;                  -- length along dimension 1
+SELECT cardinality(scores) FROM contacts;                      -- total element count
+```
+
+## Modifying arrays
+
+```sql
+-- Replace the entire array
+UPDATE contacts SET scores = '{90,85,95}' WHERE name = 'Alice';
+
+-- Update a single element
+UPDATE contacts SET scores[3] = 100 WHERE name = 'Alice';
+
+-- Update a slice
+UPDATE contacts SET scores[1:2] = '{92,88}' WHERE name = 'Alice';
+
+-- Append to the end
+UPDATE contacts SET scores = array_append(scores, 97) WHERE name = 'Bob';
+
+-- Prepend
+UPDATE contacts SET scores = array_prepend(75, scores) WHERE name = 'Bob';
+```
+
+## Array operators
+
+```sql
+-- Concatenation (||)
+SELECT ARRAY[1,2] || ARRAY[3,4];   -- {1,2,3,4}
+SELECT 0 || ARRAY[1,2];            -- {0,1,2}
+SELECT ARRAY[1,2] || 3;            -- {1,2,3}
+
+-- Equality
+SELECT ARRAY[1,2] = ARRAY[1,2];   -- true
+
+-- Containment: does the left array contain all elements of the right?
+SELECT ARRAY[1,2,3] @> ARRAY[1,3];  -- true
+
+-- Contained by
+SELECT ARRAY[1,3] <@ ARRAY[1,2,3]; -- true
+
+-- Overlap: do the arrays share any element?
+SELECT ARRAY[1,2] && ARRAY[2,3];   -- true
+```
+
+## Array functions
+
+```sql
+-- Append / prepend / concatenate
+SELECT array_append(ARRAY[1,2], 3);         -- {1,2,3}
+SELECT array_prepend(0, ARRAY[1,2]);        -- {0,1,2}
+SELECT array_cat(ARRAY[1,2], ARRAY[3,4]);  -- {1,2,3,4}
+
+-- Remove first occurrence of a value
+SELECT array_remove(ARRAY[1,2,1,3], 1);    -- {2,3}
+
+-- Replace all occurrences
+SELECT array_replace(ARRAY[1,2,1,3], 1, 9); -- {9,2,9,3}
+
+-- Fill an array
+SELECT array_fill(7, ARRAY[3]);             -- {7,7,7}
+SELECT array_fill(0, ARRAY[2,3]);           -- {{0,0,0},{0,0,0}}
+
+-- Reverse
+SELECT array_reverse(ARRAY[1,2,3,4]);       -- {4,3,2,1}
+
+-- Check if a value is in the array
+SELECT array_position(ARRAY['a','b','c'], 'b');  -- 2
+
+-- Number of occurrences
+SELECT array_positions(ARRAY[1,1,2,3,1], 1);    -- {1,2,5}
+
+-- Convert to string
+SELECT array_to_string(ARRAY[1,2,3], ',');     -- '1,2,3'
+SELECT string_to_array('a,b,c', ',');          -- {a,b,c}
+```
+
+## Unnesting arrays
+
+`unnest` expands an array into a set of rows.
+
+```sql
+SELECT unnest(ARRAY['a','b','c']);
+-- a
+-- b
+-- c
+
+-- Unnest multiple arrays in parallel (PostgreSQL 9.4+)
+SELECT * FROM unnest(ARRAY[1,2,3], ARRAY['a','b','c']) AS t(num, letter);
+--  num | letter
+-- -----+--------
+--    1 | a
+--    2 | b
+--    3 | c
+
+-- With ordinality (row number)
+SELECT num, letter, ordinality
+FROM unnest(ARRAY[10,20,30]) WITH ORDINALITY AS t(num, ordinality);
+```
+
+## Aggregating into arrays
+
+```sql
+-- Collect values into an array
+SELECT customer_id,
+       array_agg(product_no ORDER BY order_date) AS products_purchased
+FROM order_items
+JOIN orders USING (order_id)
+GROUP BY customer_id;
+
+-- Aggregate distinct values
+SELECT category,
+       array_agg(DISTINCT name ORDER BY name) AS product_names
+FROM products
+GROUP BY category;
+```
+
+## ANY and ALL
+
+`ANY` and `ALL` test a scalar value against all elements of an array.
+
+```sql
+-- True if value equals ANY element
+SELECT * FROM products WHERE category = ANY(ARRAY['electronics','appliances']);
+
+-- True if value satisfies the operator with ALL elements
+SELECT * FROM products WHERE price < ALL(ARRAY[100.00, 200.00]);
+
+-- Equivalent to IN for equality
+SELECT * FROM products WHERE category = ANY(ARRAY['electronics','appliances']);
+-- is equivalent to:
+SELECT * FROM products WHERE category IN ('electronics','appliances');
+```
+
+## GIN indexes on arrays
+
+```sql
+CREATE TABLE articles (
+    id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tags text[]
+);
+
+CREATE INDEX idx_articles_tags ON articles USING GIN (tags);
+
+-- Array containment query (uses the GIN index)
+SELECT * FROM articles WHERE tags @> ARRAY['postgresql'];
+
+-- Overlap query (uses the GIN index)
+SELECT * FROM articles WHERE tags && ARRAY['postgresql','database'];
+```
+
+## Multi-dimensional arrays
+
+All sub-arrays in a given dimension must have the same length.
+
+```sql
+-- Create a 2D schedule
+INSERT INTO schedules VALUES (
+    'Alice',
+    ARRAY[['meeting','lunch'],['training','presentation']]
+);
+
+-- Access element [day 1][slot 1]
+SELECT schedule[1][1] FROM schedules WHERE name = 'Alice';  -- 'meeting'
+
+-- Access a sub-array (all slots for day 1)
+SELECT schedule[1:1][:] FROM schedules WHERE name = 'Alice';
+-- {{meeting,lunch}}
+
+-- Dimensions
+SELECT array_dims(schedule) FROM schedules WHERE name = 'Alice';
+-- [1:2][1:2]
+```
+
+<Warning>
+Inserting a ragged multi-dimensional array (sub-arrays with different lengths) raises an error:
+
+```
+ERROR: multidimensional arrays must have sub-arrays with matching dimensions
+```
+
+All sub-arrays at the same level must have identical lengths.
+</Warning>

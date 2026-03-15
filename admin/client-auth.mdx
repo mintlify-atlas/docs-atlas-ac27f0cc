@@ -1,0 +1,225 @@
+---
+title: Client authentication
+description: Configure pg_hba.conf to control how clients authenticate to PostgreSQL, understand all supported authentication methods, and use pg_ident.conf for OS-to-database username mapping.
+---
+
+PostgreSQL authenticates clients using a configuration file traditionally named `pg_hba.conf` (HBA stands for host-based authentication). This file lives in the data directory (`$PGDATA/pg_hba.conf`) and is read at server startup and on each `SIGHUP`.
+
+To reload after editing:
+
+```bash
+pg_ctl reload -D /var/lib/pgsql/data
+# or from SQL:
+SELECT pg_reload_conf();
+```
+
+## pg_hba.conf record format
+
+Each non-comment line is a record. PostgreSQL tries each record from top to bottom and uses the **first match**. There is no fallthrough: if the matched record's authentication fails, access is denied without consulting later records.
+
+```
+TYPE  DATABASE  USER  ADDRESS       METHOD  [OPTIONS]
+```
+
+Record types:
+
+| Type | Meaning |
+|------|---------|
+| `local` | Unix-domain socket connections |
+| `host` | TCP/IP connections (SSL or non-SSL) |
+| `hostssl` | TCP/IP connections that use SSL only |
+| `hostnossl` | TCP/IP connections that do **not** use SSL |
+| `hostgssenc` | TCP/IP connections using GSSAPI encryption |
+| `hostnogssenc` | TCP/IP connections not using GSSAPI encryption |
+
+Field values:
+
+- **DATABASE**: `all`, `sameuser`, `samerole`, `replication`, a database name, or a comma-separated list. A leading `/` treats the value as a regular expression. A leading `@` references a file of names.
+- **USER**: `all`, a role name, `+rolename` (matches any member of the role), or a comma-separated list. Leading `/` for regex.
+- **ADDRESS**: An IP address with CIDR mask (e.g., `192.168.1.0/24`), `all`, `samehost`, or `samenet`. Not used for `local` records.
+
+## Authentication methods
+
+<AccordionGroup>
+  <Accordion title="trust">
+    Allows the connection unconditionally with no password or other verification. Suitable only for local connections in development or tightly controlled environments.
+
+    ```
+    local  all  postgres  trust
+    ```
+
+    <Warning>
+      Never use `trust` for remote connections or for the superuser account in any environment accessible by untrusted users.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="scram-sha-256 (recommended)">
+    Performs SCRAM-SHA-256 challenge-response authentication. The password is never sent in plaintext. This is the recommended password authentication method.
+
+    ```
+    host  all  all  0.0.0.0/0  scram-sha-256
+    ```
+
+    Set a user's password before requiring this method:
+
+    ```sql
+    ALTER ROLE alice PASSWORD 'strong_passphrase';
+    ```
+  </Accordion>
+
+  <Accordion title="md5">
+    Performs SCRAM-SHA-256 or MD5 password verification. Clients that only support MD5 can authenticate even if the server has `md5` configured.
+
+    <Warning>
+      MD5-encrypted password support is deprecated and will be removed in a future PostgreSQL release. Migrate to `scram-sha-256`.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="password">
+    Requires the client to supply a plaintext password. **Do not use over untrusted networks** — the password is transmitted unencrypted.
+
+    ```
+    host  all  all  127.0.0.1/32  password
+    ```
+  </Accordion>
+
+  <Accordion title="peer">
+    Obtains the connecting OS username from the kernel and checks whether it matches the requested database username. Available for `local` connections only.
+
+    ```
+    local  all  all  peer
+    ```
+
+    Useful when the OS user and database role names match (common on developer workstations).
+  </Accordion>
+
+  <Accordion title="ident">
+    Contacts an ident server on the client machine to obtain the OS username, then checks the mapping. Works for TCP/IP connections only. For local connections, `peer` is used instead.
+
+    ```
+    host  all  all  192.168.1.0/24  ident
+    ```
+  </Accordion>
+
+  <Accordion title="ldap">
+    Authenticates the user against an LDAP server. The database password is not used; the LDAP server validates credentials.
+
+    ```
+    host  all  all  0.0.0.0/0  ldap ldapserver=ldap.example.com ldapbasedn="dc=example,dc=com" ldapsearchattribute=uid
+    ```
+  </Accordion>
+
+  <Accordion title="radius">
+    Authenticates using a RADIUS server.
+
+    ```
+    host  all  all  0.0.0.0/0  radius radiusservers="radius.example.com" radiussecrets="supersecret"
+    ```
+  </Accordion>
+
+  <Accordion title="cert">
+    Authenticates using SSL client certificates. The `cn` (Common Name) field of the certificate must match the database username (or a mapping in `pg_ident.conf`).
+
+    ```
+    hostssl  all  all  0.0.0.0/0  cert
+    ```
+
+    Requires `ssl = on` in `postgresql.conf` and a valid CA-signed client certificate.
+  </Accordion>
+
+  <Accordion title="pam">
+    Delegates authentication to the OS Pluggable Authentication Modules (PAM) service.
+
+    ```
+    host  all  all  127.0.0.1/32  pam pamservice=postgresql
+    ```
+  </Accordion>
+
+  <Accordion title="reject">
+    Unconditionally rejects the connection. Useful to explicitly block specific hosts or users before a broader allow rule.
+
+    ```
+    host  all  all  10.0.0.5/32  reject
+    host  all  all  10.0.0.0/8   scram-sha-256
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Common pg_hba.conf examples
+
+```conf pg_hba.conf
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# Allow the postgres superuser from localhost using peer authentication
+local   all             postgres                                peer
+
+# Allow all local users via Unix socket with scram-sha-256
+local   all             all                                     scram-sha-256
+
+# Allow connections from localhost over TCP
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+
+# Allow the app role from the application subnet
+host    mydb            appuser         10.10.1.0/24            scram-sha-256
+
+# Allow replication connections from standby
+host    replication     replicator      192.168.1.100/32        scram-sha-256
+
+# Require SSL for all remote connections
+hostssl all             all             0.0.0.0/0               scram-sha-256
+hostnossl all           all             0.0.0.0/0               reject
+```
+
+<Note>
+  Lines are evaluated in order. Put more specific rules (single host, specific user/database) before broader ones.
+</Note>
+
+## Validating the configuration
+
+Use `pg_hba_file_rules` to inspect the parsed rules before reloading:
+
+```sql
+SELECT line_number, type, database, user_name, address, auth_method, error
+FROM pg_hba_file_rules
+ORDER BY line_number;
+```
+
+Rows with a non-null `error` column indicate configuration problems.
+
+## pg_ident.conf: user name maps
+
+`pg_ident.conf` maps OS usernames to database usernames. This is used with the `peer`, `ident`, `gss`, and `cert` methods when you specify `map=mapname` in `pg_hba.conf`.
+
+Format:
+
+```
+MAP-NAME  SYSTEM-USERNAME  PG-USERNAME
+```
+
+Example — map OS user `alice` to the database role `webapp`, and allow any OS user whose name matches the regex `^(.*)$` to connect as the same-named database role:
+
+```conf pg_ident.conf
+# MAPNAME       SYSTEM-USERNAME     PG-USERNAME
+developer       alice               webapp
+developer       /^(.*)$             \1
+```
+
+Then reference the map in `pg_hba.conf`:
+
+```conf pg_hba.conf
+local  all  all  peer map=developer
+```
+
+<Tip>
+  User name maps let a single database role be shared by multiple OS users without giving them identical OS-level names. They also allow SSL certificate CNs that don't exactly match database role names.
+</Tip>
+
+## Authentication troubleshooting
+
+When a connection is rejected, check:
+
+1. **Server log** — authentication failures and the rule that matched are logged.
+2. **pg_hba_file_rules** — verify the rule you expect is present and in the right order.
+3. **listen_addresses** — ensure the server is listening on the interface the client is connecting to.
+4. **SSL requirements** — `hostssl` records are silently ignored (with a log warning) if `ssl = off`.

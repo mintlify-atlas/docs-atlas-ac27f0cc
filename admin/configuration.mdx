@@ -1,0 +1,236 @@
+---
+title: Server configuration
+description: Reference for essential PostgreSQL GUC parameters covering connections, memory, WAL, query planning, logging, and autovacuum, with guidance on reloading and applying configuration changes.
+---
+
+PostgreSQL uses a **Grand Unified Configuration** (GUC) system. All parameters live in `$PGDATA/postgresql.conf`. Parameters set there provide cluster-wide defaults that sessions can override (where permitted).
+
+## Setting parameters
+
+Edit `postgresql.conf` directly:
+
+```ini postgresql.conf
+shared_buffers = 256MB
+work_mem = 4MB
+log_min_duration_statement = 1000
+```
+
+Alternatively, use `ALTER SYSTEM` to write to `postgresql.auto.conf`, which takes precedence over `postgresql.conf`:
+
+```sql
+ALTER SYSTEM SET shared_buffers = '512MB';
+```
+
+For the current session only:
+
+```sql
+SET work_mem = '64MB';
+```
+
+## Reloading configuration
+
+Most parameters take effect after a reload (no restart required):
+
+```bash
+# From the shell
+pg_ctl reload -D /var/lib/pgsql/data
+
+# From SQL
+SELECT pg_reload_conf();
+```
+
+A reload sends `SIGHUP` to the postmaster, which propagates it to all backend processes. Parameters marked `requires restart` in `pg_settings` only take effect after a full server restart.
+
+To inspect current values and when they take effect:
+
+```sql
+SELECT name, setting, unit, context, pending_restart
+FROM pg_settings
+WHERE name IN ('shared_buffers', 'max_connections', 'work_mem');
+```
+
+## Connection settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `listen_addresses` | `localhost` | IP addresses to listen on. Use `'*'` for all interfaces. |
+| `port` | `5432` | TCP port |
+| `max_connections` | `100` | Maximum concurrent client connections |
+| `superuser_reserved_connections` | `3` | Connections reserved for superusers |
+| `unix_socket_directories` | `/tmp` | Directory for Unix domain socket files |
+
+<Warning>
+  To accept remote connections, set `listen_addresses = '*'` **and** add appropriate entries to `pg_hba.conf`. Changing `listen_addresses` or `max_connections` requires a server restart.
+</Warning>
+
+```ini postgresql.conf
+listen_addresses = '*'
+port = 5432
+max_connections = 200
+```
+
+## Memory settings
+
+<CardGroup cols={2}>
+  <Card title="shared_buffers" icon="database">
+    Shared memory pool for caching data pages. Set to approximately 25% of total RAM. Requires restart.
+  </Card>
+  <Card title="work_mem" icon="cpu">
+    Memory per sort or hash operation. Multiplied by `max_connections` × parallel operations in the worst case.
+  </Card>
+  <Card title="maintenance_work_mem" icon="wrench">
+    Memory for maintenance operations: `VACUUM`, `CREATE INDEX`, `ALTER TABLE ADD FOREIGN KEY`. Can be set higher than `work_mem`.
+  </Card>
+  <Card title="effective_cache_size" icon="server">
+    Planner estimate of the total disk cache available (OS + `shared_buffers`). Set to ~75% of RAM. Does not allocate memory.
+  </Card>
+</CardGroup>
+
+```ini postgresql.conf
+shared_buffers = 2GB              # 25% of 8 GB RAM
+work_mem = 16MB
+maintenance_work_mem = 512MB
+effective_cache_size = 6GB        # 75% of 8 GB RAM
+```
+
+<Note>
+  `work_mem` is per sort/hash operation, not per connection. A complex query may use multiple sort steps simultaneously. Start conservatively and increase based on observed behavior.
+</Note>
+
+## WAL settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `wal_level` | `replica` | Minimum: `minimal`. Set `replica` for streaming replication, `logical` for logical replication. |
+| `fsync` | `on` | Guarantee WAL is flushed to disk. Never disable in production. |
+| `synchronous_commit` | `on` | Whether to wait for WAL to be flushed before reporting commit success. |
+| `max_wal_size` | `1GB` | Maximum WAL size before a checkpoint is forced. |
+| `min_wal_size` | `80MB` | Minimum amount of WAL to retain. |
+| `checkpoint_completion_target` | `0.9` | Fraction of checkpoint interval over which to spread checkpoint I/O. |
+| `wal_buffers` | `16MB` | Shared memory for WAL data not yet written to disk. |
+
+```ini postgresql.conf
+wal_level = replica
+max_wal_size = 4GB
+min_wal_size = 1GB
+checkpoint_completion_target = 0.9
+```
+
+<Tip>
+  Setting `checkpoint_completion_target = 0.9` spreads checkpoint writes across 90% of the checkpoint interval, reducing I/O spikes.
+</Tip>
+
+## Query planner settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `random_page_cost` | `4.0` | Cost of a random disk page fetch relative to sequential. Lower for SSDs (e.g., `1.1`). |
+| `seq_page_cost` | `1.0` | Cost of a sequential disk page fetch (baseline). |
+| `effective_io_concurrency` | `1` | Estimated number of concurrent I/O operations. Set to the number of disks or RAID spindles; use `200` for SSDs. |
+| `default_statistics_target` | `100` | Number of histogram buckets for `ANALYZE`. Increase for tables with skewed data. |
+| `enable_seqscan` | `on` | Allow sequential scans. Disable per-session to force index use for testing only. |
+| `enable_indexscan` | `on` | Allow index scans. |
+| `enable_hashjoin` | `on` | Allow hash joins. |
+| `enable_mergejoin` | `on` | Allow merge joins. |
+| `enable_nestloop` | `on` | Allow nested loop joins. |
+
+```ini postgresql.conf
+# SSD-optimized planner settings
+random_page_cost = 1.1
+effective_io_concurrency = 200
+default_statistics_target = 200
+```
+
+<Warning>
+  `enable_*` flags are diagnostic tools. Disabling them globally degrades query performance for other queries. Use `SET enable_seqscan = off` only in a session for investigation.
+</Warning>
+
+## Logging settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `log_destination` | `stderr` | Where to send log output: `stderr`, `csvlog`, `jsonlog`, `syslog`. |
+| `logging_collector` | `off` | Capture stderr into log files. Required for `csvlog`/`jsonlog`. |
+| `log_directory` | `log` | Directory for log files (relative to `PGDATA`). |
+| `log_filename` | `postgresql-%Y-%m-%d_%H%M%S.log` | Log file name pattern. |
+| `log_rotation_age` | `1d` | Rotate log files after this interval. |
+| `log_min_duration_statement` | `-1` (disabled) | Log queries taking longer than this many milliseconds. |
+| `log_connections` | `off` | Log each new connection. |
+| `log_disconnections` | `off` | Log session end with duration. |
+| `log_line_prefix` | `%m [%p]` | Prefix prepended to each log line. |
+| `log_lock_waits` | `off` | Log when a session waits for a lock longer than `deadlock_timeout`. |
+| `log_temp_files` | `-1` (disabled) | Log temporary file creation above this size (bytes). |
+
+```ini postgresql.conf
+logging_collector = on
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d.log'
+log_rotation_age = 1d
+log_min_duration_statement = 500   # log queries over 500 ms
+log_connections = on
+log_lock_waits = on
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+```
+
+## Autovacuum settings
+
+Autovacuum runs in the background to reclaim dead tuple space, update planner statistics, and prevent transaction ID wraparound. It is enabled by default.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `autovacuum` | `on` | Enable the autovacuum daemon. |
+| `autovacuum_max_workers` | `3` | Maximum number of autovacuum worker processes. |
+| `autovacuum_naptime` | `1min` | Time between autovacuum runs on each database. |
+| `autovacuum_vacuum_threshold` | `50` | Minimum number of updated/deleted rows before triggering VACUUM. |
+| `autovacuum_vacuum_scale_factor` | `0.2` | Fraction of table size added to threshold (20% of table rows by default). |
+| `autovacuum_analyze_threshold` | `50` | Minimum row changes before triggering ANALYZE. |
+| `autovacuum_analyze_scale_factor` | `0.1` | Fraction of table size for ANALYZE threshold (10%). |
+| `autovacuum_vacuum_cost_delay` | `2ms` | Delay between autovacuum I/O cost chunks. |
+| `log_autovacuum_min_duration` | `10min` | Log autovacuum runs taking longer than this. Use `0` to log all. |
+
+```ini postgresql.conf
+autovacuum = on
+autovacuum_max_workers = 5
+autovacuum_vacuum_scale_factor = 0.05   # vacuum more aggressively
+autovacuum_analyze_scale_factor = 0.02
+log_autovacuum_min_duration = 0         # log all autovacuum activity
+```
+
+<Note>
+  For large tables, the default `autovacuum_vacuum_scale_factor = 0.2` means autovacuum triggers only after 20% of rows change. For a 100-million-row table, that's 20 million rows. Override on a per-table basis with `ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = 0.01)`.
+</Note>
+
+## Complete example: modest production server (8 GB RAM)
+
+```ini postgresql.conf
+# Connections
+listen_addresses = '*'
+max_connections = 100
+
+# Memory
+shared_buffers = 2GB
+work_mem = 32MB
+maintenance_work_mem = 512MB
+effective_cache_size = 6GB
+
+# WAL
+wal_level = replica
+max_wal_size = 4GB
+checkpoint_completion_target = 0.9
+
+# Planner
+random_page_cost = 1.1
+effective_io_concurrency = 200
+
+# Logging
+logging_collector = on
+log_min_duration_statement = 500
+log_connections = on
+log_lock_waits = on
+
+# Autovacuum
+autovacuum_max_workers = 4
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+log_autovacuum_min_duration = 250
+```

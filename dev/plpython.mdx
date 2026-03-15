@@ -1,0 +1,300 @@
+---
+title: PL/Python — Python procedural language
+description: Write PostgreSQL functions and procedures in Python using PL/Python (plpython3u). Covers function creation, data types, SPI queries, subtransactions, and error handling.
+---
+
+PL/Python is an untrusted procedural language that lets you write PostgreSQL functions and procedures in Python 3.
+
+<Warning>
+PL/Python is an **untrusted** language (`plpython3u`). Functions written in it run with the full privileges of the database administrator. Only superusers can create functions in `plpython3u`.
+</Warning>
+
+## Installation
+
+```sql
+CREATE EXTENSION plpython3u;
+```
+
+<Tip>
+If you install the language into `template1`, all subsequently created databases will have it available automatically.
+</Tip>
+
+## Creating functions
+
+```sql
+CREATE FUNCTION funcname (argument-list)
+  RETURNS return-type
+AS $$
+  # PL/Python function body
+$$ LANGUAGE plpython3u;
+```
+
+The body is a Python script. Arguments are passed as global variables by their names. The result is returned with a `return` statement.
+
+**Example:**
+
+```sql
+CREATE FUNCTION pymax(a integer, b integer)
+  RETURNS integer
+AS $$
+  if a > b:
+    return a
+  return b
+$$ LANGUAGE plpython3u;
+
+SELECT pymax(3, 7);  -- returns 7
+```
+
+<Note>
+PL/Python wraps the function body in a Python function definition internally. Argument variables are set as globals. Reassigning an argument variable inside the function requires declaring it `global x` first, but it is better practice to treat parameters as read-only.
+</Note>
+
+## Data type mapping
+
+### PostgreSQL → Python (on input)
+
+| PostgreSQL type | Python type |
+|-----------------|-------------|
+| `boolean` | `bool` |
+| `smallint`, `int`, `bigint`, `oid` | `int` |
+| `real`, `double precision` | `float` |
+| `numeric` | `decimal.Decimal` |
+| `bytea` | `bytes` |
+| All other types (including `text`, `varchar`) | `str` |
+| SQL NULL | `None` |
+
+### Python → PostgreSQL (on return)
+
+For most return types, the Python value is converted to a string and passed to the PostgreSQL type's input function. `float` values use `repr()` to avoid precision loss. `bool` is evaluated by Python truth rules (`'f'` is truthy in Python but false in SQL — use `STRICT` or check explicitly).
+
+### Handling NULL
+
+```sql
+CREATE FUNCTION pymax(a integer, b integer)
+  RETURNS integer
+AS $$
+  if (a is None) or (b is None):
+    return None
+  if a > b:
+    return a
+  return b
+$$ LANGUAGE plpython3u;
+```
+
+Or declare the function `STRICT` to have PostgreSQL skip the call and return NULL automatically when any argument is NULL:
+
+```sql
+CREATE FUNCTION pymax(a integer, b integer)
+  RETURNS integer STRICT
+AS $$
+  return a if a > b else b
+$$ LANGUAGE plpython3u;
+```
+
+### Arrays
+
+SQL arrays become Python lists and vice versa:
+
+```sql
+CREATE FUNCTION return_arr()
+  RETURNS int[]
+AS $$
+return [1, 2, 3, 4, 5]
+$$ LANGUAGE plpython3u;
+
+SELECT return_arr();  -- returns {1,2,3,4,5}
+```
+
+### Composite types
+
+Composite-type arguments arrive as Python dicts. To return a composite type, return a dict, tuple/list, or an object with `__getattr__`:
+
+```sql
+CREATE TYPE named_value AS (
+  name   text,
+  value  integer
+);
+
+CREATE FUNCTION make_pair(name text, value integer)
+  RETURNS named_value
+AS $$
+  return { "name": name, "value": value }
+$$ LANGUAGE plpython3u;
+```
+
+### Set-returning functions
+
+Return a sequence, iterator, or use `yield`:
+
+```sql
+CREATE TYPE greeting AS (how text, who text);
+
+CREATE FUNCTION greet(how text)
+  RETURNS SETOF greeting
+AS $$
+  for who in ["World", "PostgreSQL", "PL/Python"]:
+    yield (how, who)
+$$ LANGUAGE plpython3u;
+
+SELECT * FROM greet('Hello');
+```
+
+## Persistent state: SD and GD
+
+PL/Python provides two dictionaries for storing data between function calls:
+
+| Dict | Scope | Description |
+|------|-------|-------------|
+| `SD` | Per-function | Private to the function. Reset when the function is redefined. |
+| `GD` | Session-wide | Shared across all PL/Python functions in the session. |
+
+```sql
+CREATE FUNCTION count_calls() RETURNS integer AS $$
+  if 'n' not in SD:
+    SD['n'] = 0
+  SD['n'] += 1
+  return SD['n']
+$$ LANGUAGE plpython3u;
+
+SELECT count_calls();  -- 1
+SELECT count_calls();  -- 2
+```
+
+## Database access with plpy
+
+The `plpy` module provides access to the database from within a PL/Python function.
+
+### plpy.execute
+
+Execute a query and return a result object:
+
+```sql
+CREATE FUNCTION get_user_email(username text) RETURNS text AS $$
+  res = plpy.execute(
+    "SELECT email FROM users WHERE name = $1",
+    [username]
+  )
+  if len(res) == 0:
+    return None
+  return res[0]['email']
+$$ LANGUAGE plpython3u;
+```
+
+`plpy.execute` returns a list-like object. Each element is a dict mapping column names to values.
+
+You can limit rows:
+
+```python
+res = plpy.execute("SELECT * FROM big_table", 100)  # max 100 rows
+```
+
+### plpy.prepare and plpy.execute
+
+For queries executed many times, prepare them first:
+
+```sql
+CREATE FUNCTION update_balance(account_id integer, delta numeric)
+  RETURNS void AS $$
+  plan = plpy.prepare(
+    "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+    ["numeric", "integer"]
+  )
+  plpy.execute(plan, [delta, account_id])
+$$ LANGUAGE plpython3u;
+```
+
+### plpy.cursor
+
+For large result sets, use a cursor to avoid loading all rows into memory:
+
+```python
+cur = plpy.cursor("SELECT * FROM large_table")
+while True:
+    rows = cur.fetch(100)
+    if not rows:
+        break
+    for row in rows:
+        process(row)
+```
+
+### Result object attributes
+
+| Attribute / method | Description |
+|---------------------|-------------|
+| `res[i]['col']` | Value at row `i`, column `col` |
+| `len(res)` | Number of rows |
+| `res.status()` | SPI status code |
+| `res.nrows()` | Rows affected |
+| `res.colnames()` | List of column names |
+| `res.coltypes()` | List of column type OIDs |
+
+## Subtransactions
+
+Use `plpy.subtransaction()` as a context manager to run a block of code in a subtransaction:
+
+```sql
+CREATE FUNCTION safe_transfer(src integer, dst integer, amount numeric)
+  RETURNS void AS $$
+  with plpy.subtransaction():
+    plpy.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+                 [amount, src])
+    plpy.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+                 [amount, dst])
+$$ LANGUAGE plpython3u;
+```
+
+If an exception occurs inside the `with` block, the subtransaction is rolled back but the outer transaction continues. If you do not catch the exception it propagates upward.
+
+## Raising errors and messages
+
+```python
+plpy.debug('Debug message: %s', value)
+plpy.log('Log message')
+plpy.info('Informational message')
+plpy.notice('Notice: row count is %d', n)
+plpy.warning('Warning: deprecated usage')
+plpy.error('Something went wrong')     # raises PLy_SpiError
+plpy.fatal('Fatal condition')          # always raises
+```
+
+To raise a PostgreSQL error with a specific SQLSTATE code:
+
+```python
+if amount <= 0:
+    plpy.error("Amount must be positive",
+               sqlstate="22003",
+               hint="Provide a positive numeric value")
+```
+
+You can also raise standard Python exceptions; they are converted to PostgreSQL errors.
+
+## Triggers
+
+PL/Python trigger functions receive a `TD` dict with trigger metadata:
+
+| Key | Description |
+|-----|-------------|
+| `TD["event"]` | `"INSERT"`, `"UPDATE"`, `"DELETE"`, `"TRUNCATE"` |
+| `TD["when"]` | `"BEFORE"`, `"AFTER"`, `"INSTEAD OF"` |
+| `TD["level"]` | `"ROW"` or `"STATEMENT"` |
+| `TD["new"]` | Dict of new row values (INSERT/UPDATE) |
+| `TD["old"]` | Dict of old row values (UPDATE/DELETE) |
+| `TD["name"]` | Trigger name |
+| `TD["table_name"]` | Table name |
+| `TD["table_schema"]` | Table schema |
+| `TD["args"]` | List of trigger arguments |
+
+```sql
+CREATE FUNCTION stamp_modified() RETURNS trigger AS $$
+  if TD["event"] in ("INSERT", "UPDATE"):
+    TD["new"]["modified_at"] = plpy.execute("SELECT now()")[0]["now"]
+    return "MODIFY"   -- return "MODIFY" to use modified TD["new"]
+  return None
+$$ LANGUAGE plpython3u;
+
+CREATE TRIGGER stamp_modified_trigger
+    BEFORE INSERT OR UPDATE ON items
+    FOR EACH ROW EXECUTE FUNCTION stamp_modified();
+```
+
+Return values for row triggers: `None` or `"OK"` to proceed unchanged; `"SKIP"` to suppress the operation (BEFORE only); `"MODIFY"` when `TD["new"]` was changed.

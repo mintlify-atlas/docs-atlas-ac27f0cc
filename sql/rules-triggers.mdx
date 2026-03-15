@@ -1,0 +1,288 @@
+---
+title: 'Rules and triggers'
+description: 'CREATE TRIGGER (BEFORE/AFTER/INSTEAD OF, ROW/STATEMENT level), trigger functions returning trigger, OLD/NEW records, and CREATE RULE with rules vs triggers comparison in PostgreSQL.'
+---
+
+## Triggers
+
+A trigger is a specification that PostgreSQL should automatically call a function whenever a certain type of operation is performed on a table, view, or foreign table.
+
+### Overview
+
+Triggers fire on `INSERT`, `UPDATE`, `DELETE`, and `TRUNCATE`. They can be:
+
+- **BEFORE**: The trigger fires before the operation. A row-level BEFORE trigger can modify the row or cancel the operation.
+- **AFTER**: The trigger fires after the operation is complete.
+- **INSTEAD OF**: Only on views; replaces the default operation.
+
+Triggers are also classified as **row-level** (fired once per affected row) or **statement-level** (fired once per SQL statement).
+
+### Writing a trigger function
+
+A trigger function takes no arguments and returns type `trigger`. It accesses the new and old row through the special variables `NEW` and `OLD` (in PL/pgSQL).
+
+```sql
+CREATE OR REPLACE FUNCTION update_modified_column()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.modified_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$;
+```
+
+- `NEW`: the new row (available in INSERT and UPDATE triggers)
+- `OLD`: the old row (available in UPDATE and DELETE triggers)
+- A row-level BEFORE trigger must return `NEW` (to proceed with the modified row), `OLD` (for DELETE), or `NULL` to cancel the operation.
+
+### CREATE TRIGGER syntax
+
+```sql
+CREATE [ OR REPLACE ] TRIGGER name
+{ BEFORE | AFTER | INSTEAD OF }
+{ INSERT | UPDATE [ OF column_name [, ...] ] | DELETE | TRUNCATE } [, ...]
+ON table_name
+[ FOR [ EACH ] { ROW | STATEMENT } ]
+[ WHEN ( condition ) ]
+EXECUTE FUNCTION function_name(arguments);
+```
+
+### Examples
+
+<Steps>
+  <Step title="Automatic timestamp update">
+
+```sql
+CREATE TABLE documents (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title       text NOT NULL,
+    body        text,
+    created_at  timestamptz DEFAULT CURRENT_TIMESTAMP,
+    modified_at timestamptz DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE OR REPLACE FUNCTION set_modified_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.modified_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_documents_modified
+    BEFORE UPDATE ON documents
+    FOR EACH ROW
+    EXECUTE FUNCTION set_modified_at();
+```
+
+  </Step>
+
+  <Step title="Audit log trigger">
+
+```sql
+CREATE TABLE audit_log (
+    id         bigint GENERATED ALWAYS AS IDENTITY,
+    table_name text,
+    operation  text,
+    old_data   jsonb,
+    new_data   jsonb,
+    changed_by text DEFAULT current_user,
+    changed_at timestamptz DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE OR REPLACE FUNCTION audit_changes()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        INSERT INTO audit_log (table_name, operation, old_data)
+        VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD));
+        RETURN OLD;
+    ELSIF TG_OP = 'UPDATE' THEN
+        INSERT INTO audit_log (table_name, operation, old_data, new_data)
+        VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW));
+        RETURN NEW;
+    ELSIF TG_OP = 'INSERT' THEN
+        INSERT INTO audit_log (table_name, operation, new_data)
+        VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(NEW));
+        RETURN NEW;
+    END IF;
+END;
+$$;
+
+CREATE TRIGGER trg_orders_audit
+    AFTER INSERT OR UPDATE OR DELETE ON orders
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_changes();
+```
+
+  </Step>
+
+  <Step title="Validation trigger">
+
+```sql
+CREATE OR REPLACE FUNCTION validate_order_amount()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.amount <= 0 THEN
+        RAISE EXCEPTION 'Order amount must be positive, got %', NEW.amount;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_orders_validate
+    BEFORE INSERT OR UPDATE ON orders
+    FOR EACH ROW
+    EXECUTE FUNCTION validate_order_amount();
+```
+
+  </Step>
+
+  <Step title="INSTEAD OF trigger on a view">
+
+```sql
+CREATE VIEW active_products AS
+    SELECT * FROM products WHERE active = true;
+
+CREATE OR REPLACE FUNCTION active_products_insert()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO products VALUES (NEW.*) ;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_active_products_insert
+    INSTEAD OF INSERT ON active_products
+    FOR EACH ROW
+    EXECUTE FUNCTION active_products_insert();
+```
+
+  </Step>
+</Steps>
+
+### Conditional triggers with WHEN
+
+The `WHEN` clause lets the trigger fire only when a condition is true, avoiding unnecessary function calls:
+
+```sql
+CREATE TRIGGER trg_price_changed
+    AFTER UPDATE OF price ON products
+    FOR EACH ROW
+    WHEN (OLD.price IS DISTINCT FROM NEW.price)
+    EXECUTE FUNCTION notify_price_change();
+```
+
+### Trigger execution order
+
+Multiple triggers on the same event fire in alphabetical order by trigger name. Name triggers accordingly if order matters (e.g., `a_audit`, `b_validate`, `c_notify`).
+
+### Special trigger variables (PL/pgSQL)
+
+| Variable | Description |
+|---|---|
+| `NEW` | The new row for INSERT/UPDATE (NULL for DELETE) |
+| `OLD` | The old row for UPDATE/DELETE (NULL for INSERT) |
+| `TG_OP` | Operation: `'INSERT'`, `'UPDATE'`, `'DELETE'`, `'TRUNCATE'` |
+| `TG_TABLE_NAME` | Name of the table that triggered the call |
+| `TG_TABLE_SCHEMA` | Schema of the table |
+| `TG_WHEN` | `'BEFORE'`, `'AFTER'`, or `'INSTEAD OF'` |
+| `TG_LEVEL` | `'ROW'` or `'STATEMENT'` |
+| `TG_ARGV` | Array of string arguments from the `CREATE TRIGGER` statement |
+
+### Managing triggers
+
+```sql
+-- Disable a trigger
+ALTER TABLE orders DISABLE TRIGGER trg_orders_audit;
+
+-- Enable it again
+ALTER TABLE orders ENABLE TRIGGER trg_orders_audit;
+
+-- Drop a trigger
+DROP TRIGGER trg_orders_audit ON orders;
+```
+
+## Rules
+
+The PostgreSQL rule system rewrites queries before they reach the planner. It operates at the query tree level, not at the executor level.
+
+### How rules work
+
+A rule is stored in `pg_rewrite`. When a matching query arrives, the rule system rewrites the query tree before planning and execution. Views in PostgreSQL are implemented as `ON SELECT DO INSTEAD` rules.
+
+```sql
+-- What CREATE VIEW actually does internally
+CREATE VIEW active_products AS SELECT * FROM products WHERE active = true;
+
+-- Equivalent to:
+CREATE TABLE active_products (/* same columns */);
+CREATE RULE "_RETURN" AS
+    ON SELECT TO active_products
+    DO INSTEAD SELECT * FROM products WHERE active = true;
+```
+
+### CREATE RULE syntax
+
+```sql
+CREATE [ OR REPLACE ] RULE name AS
+    ON { SELECT | INSERT | UPDATE | DELETE }
+    TO table_name
+    [ WHERE condition ]
+    DO [ ALSO | INSTEAD ] { NOTHING | command | ( command ; command ... ) };
+```
+
+### Example: redirect inserts
+
+```sql
+CREATE RULE insert_into_current AS
+    ON INSERT TO events
+    WHERE NEW.created_at >= CURRENT_DATE
+    DO INSTEAD
+        INSERT INTO events_current VALUES (NEW.*);
+```
+
+### Example: update-logging rule
+
+```sql
+CREATE RULE log_price_update AS
+    ON UPDATE TO products
+    WHERE OLD.price <> NEW.price
+    DO ALSO
+        INSERT INTO price_history (product_no, old_price, new_price, changed_at)
+        VALUES (OLD.product_no, OLD.price, NEW.price, CURRENT_TIMESTAMP);
+```
+
+## Rules vs triggers comparison
+
+<CardGroup cols={2}>
+  <Card title="Rules">
+    - Rewrite queries before planning
+    - Applied to all statements targeting the table, including those from views
+    - Can redirect an entire statement (DO INSTEAD NOTHING to suppress)
+    - Views are implemented as rules
+    - Less predictable in complex queries; harder to debug
+    - Cannot reference `NEW`/`OLD` in statement-level rules
+  </Card>
+  <Card title="Triggers">
+    - Execute functions at runtime, per row or per statement
+    - Easier to understand, debug, and test
+    - Access to OLD and NEW row values in row-level triggers
+    - Support WHEN conditions for conditional execution
+    - Work correctly across inheritance hierarchies
+    - Preferred for most application logic
+  </Card>
+</CardGroup>
+
+<Note>
+For most use cases—audit logging, validation, derived columns, notifications—prefer triggers over rules. Rules are primarily useful for implementing updatable views and for suppressing operations entirely with `DO INSTEAD NOTHING`.
+</Note>
+
+### Dropping rules
+
+```sql
+DROP RULE insert_into_current ON events;
+DROP RULE IF EXISTS log_price_update ON products;
+```

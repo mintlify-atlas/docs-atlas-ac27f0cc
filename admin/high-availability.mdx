@@ -1,0 +1,170 @@
+---
+title: High availability
+description: Overview of high availability options for PostgreSQL including streaming replication, synchronous replication, external HA tools like Patroni and repmgr, connection pooling with PgBouncer, and load balancing approaches.
+---
+
+PostgreSQL supports several approaches to high availability (HA). Understanding each option's trade-offs — data loss risk, failover time, read scalability, and operational complexity — helps you choose the right architecture.
+
+## HA options overview
+
+<CardGroup cols={2}>
+  <Card title="Streaming replication" icon="arrow-right-arrow-left">
+    Built-in primary/standby replication using WAL streaming. Asynchronous by default; can be made synchronous. Hot standby supports read-only queries.
+  </Card>
+  <Card title="Log-shipping (warm standby)" icon="file-export">
+    File-based WAL shipping to a standby. Higher data loss window than streaming but simpler to configure. Standby is unavailable for queries until promotion.
+  </Card>
+  <Card title="Logical replication" icon="table">
+    Per-table replication using the publish/subscribe model. Supports cross-version replication and selective table replication.
+  </Card>
+  <Card title="Shared disk failover" icon="hard-drive">
+    Multiple servers share a single disk array. No data synchronization overhead; if the primary fails, a standby mounts the shared disk. Single point of failure at the storage level.
+  </Card>
+</CardGroup>
+
+## Primary/standby with streaming replication
+
+Streaming replication is the most common PostgreSQL HA approach. A standby server connects to the primary and receives WAL records as they are generated, staying near real-time.
+
+- **Asynchronous** (default): commits complete on the primary immediately. A small window of data loss exists on failover.
+- **Synchronous**: commits wait for confirmation from one or more standbys. Zero data loss but increased commit latency.
+
+See [streaming replication](/admin/streaming-replication) for the full setup procedure.
+
+### Hot standby
+
+When `hot_standby = on` (the default since PostgreSQL 9.0), a standby in recovery mode accepts read-only queries. This allows you to offload reporting and read-heavy workloads to the standby.
+
+```ini postgresql.conf  (standby)
+hot_standby = on
+hot_standby_feedback = on   # prevents vacuum on primary from canceling standby queries
+```
+
+### Promoting a standby
+
+To promote a standby to a primary after the original primary fails:
+
+```bash
+# From the OS
+pg_ctl promote -D /var/lib/pgsql/data
+
+# Or from SQL (on the standby itself)
+SELECT pg_promote();
+```
+
+After promotion, the former standby opens for read/write and begins a new WAL timeline.
+
+## Synchronous replication
+
+Synchronous replication guarantees that a committed transaction has been written to durable storage on at least one standby before the commit returns to the client.
+
+Configure on the primary:
+
+```ini postgresql.conf  (primary)
+synchronous_standby_names = 'standby1'
+synchronous_commit = on
+```
+
+`synchronous_commit` levels:
+
+| Level | Guarantee |
+|-------|----------|
+| `on` (default) | WAL flushed to disk on primary and at least one synchronous standby |
+| `remote_write` | WAL received and written to OS buffers on standby (not fsync'd) |
+| `remote_apply` | Transaction applied (visible) on standby |
+| `local` | WAL flushed on primary only (standby is ignored) |
+| `off` | No wait; highest risk of data loss |
+
+To specify multiple standbys or quorum-based synchronous replication:
+
+```ini
+# Wait for any 1 of the listed standbys
+synchronous_standby_names = 'ANY 1 (standby1, standby2, standby3)'
+
+# Wait for all listed standbys
+synchronous_standby_names = 'FIRST 2 (standby1, standby2)'
+```
+
+<Warning>
+  With synchronous replication, if the synchronous standby is unavailable, all write transactions on the primary will block. Have a plan for degrading to asynchronous replication during standby maintenance.
+</Warning>
+
+## External HA tools
+
+PostgreSQL does not include built-in automatic failover. Production systems typically combine PostgreSQL streaming replication with an external HA manager.
+
+### Patroni
+
+[Patroni](https://patroni.readthedocs.io/) is the most widely adopted PostgreSQL HA solution. It uses a distributed consensus store (etcd, Consul, or ZooKeeper) to coordinate leader election and automatic failover.
+
+Key features:
+- Automatic leader election and failover
+- REST API for management and health checks
+- Handles split-brain via consensus quorum
+- `patronictl` CLI for operations
+
+### repmgr
+
+[repmgr](https://repmgr.org/) (replication manager) is a lighter-weight HA and replication management tool. It monitors the replication cluster and provides controlled switchover and failover, but does not prevent split-brain without additional fencing.
+
+### pgBouncer (connection pooling)
+
+[PgBouncer](https://www.pgbouncer.org/) is a lightweight connection pooler that sits in front of PostgreSQL. It reduces the overhead of connection establishment and limits the number of actual server connections.
+
+Pooling modes:
+
+| Mode | Description |
+|------|-------------|
+| `session` | Each client connection occupies a server connection for its lifetime. Lowest functionality loss. |
+| `transaction` | Server connection is held only while a transaction is active. Most efficient. |
+| `statement` | Server connection is released after each statement. Requires application compatibility. |
+
+A minimal `pgbouncer.ini`:
+
+```ini pgbouncer.ini
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb
+
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 25
+listen_port = 6432
+listen_addr = 0.0.0.0
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+```
+
+<Note>
+  Transaction-mode pooling is incompatible with session-level features such as `SET` commands that persist across statements, advisory locks, and `LISTEN`/`NOTIFY`. Evaluate compatibility with your application before using transaction mode.
+</Note>
+
+## Load balancing read queries
+
+PostgreSQL standbys running in hot standby mode accept read-only queries. You can route reads to standbys using several approaches:
+
+- **Application-level**: the application explicitly directs reads to a secondary connection string and writes to the primary.
+- **HAProxy**: configure separate backends for the primary (write) and standbys (read), using `pg_is_in_recovery()` checks as health probes.
+- **Pgpool-II**: a middleware layer that parses SQL and routes reads to standbys and writes to the primary. More complex but provides transparent load balancing.
+
+Example HAProxy backend check command:
+
+```
+PGPASSWORD=monitorpass psql -h %a -U monitor -c "SELECT NOT pg_is_in_recovery()" -t | grep -q t
+```
+
+This health check returns success only on the primary, so HAProxy routes write traffic exclusively to the primary backend.
+
+## Replication slots and data loss risk
+
+Replication slots prevent the primary from discarding WAL segments that a standby has not yet received. This eliminates the "standby fell too far behind and needs re-seeding" problem, at the cost of unbounded WAL accumulation if the standby goes offline.
+
+To limit slot-based WAL retention:
+
+```ini postgresql.conf
+max_slot_wal_keep_size = 10GB   # invalidate slot if WAL usage exceeds this
+```
+
+<Warning>
+  An inactive replication slot with no `max_slot_wal_keep_size` configured will cause WAL to accumulate indefinitely, eventually filling the disk. Monitor slot lag with `pg_replication_slots`.
+</Warning>

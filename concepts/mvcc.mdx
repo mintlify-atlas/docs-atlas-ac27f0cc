@@ -1,0 +1,249 @@
+---
+title: "MVCC"
+description: "How PostgreSQL implements Multiversion Concurrency Control (MVCC) — tuple visibility, xmin/xmax, transaction snapshots, HOT updates, and VACUUM."
+---
+
+PostgreSQL maintains data consistency internally using a **multiversion model** — Multiversion Concurrency Control (MVCC). Each SQL statement sees a snapshot of data as it was at some point in time, regardless of the current state of the underlying data. This prevents statements from viewing inconsistent data produced by concurrent transactions, providing transaction isolation for each database session.
+
+The main advantage of MVCC over locking-based approaches is that **locks acquired for reading data do not conflict with locks acquired for writing data** — reading never blocks writing, and writing never blocks reading.
+
+## How MVCC works
+
+Instead of modifying rows in place and using read locks to protect readers from seeing partial updates, PostgreSQL keeps **multiple versions** of each row. A new transaction sees a consistent snapshot of the committed data as of the moment it began (or as of the moment each statement began, in Read Committed mode).
+
+When a row is updated, the old version is not immediately removed. Both the old and new versions coexist on the heap page. The visibility rules determine which version each transaction sees.
+
+## Tuple visibility: xmin and xmax
+
+Every heap tuple (physical row version) carries two transaction ID fields in its header, defined in the heap access method (`src/backend/access/heap/heapam.c`):
+
+| Field | Meaning |
+|---|---|
+| `t_xmin` | Transaction ID of the transaction that **inserted** this tuple version |
+| `t_xmax` | Transaction ID of the transaction that **deleted or updated** this tuple version (0 if the row is still current) |
+| `t_ctid` | Physical location `(page, offset)` of this tuple, or of the newest version if this one has been updated |
+
+A tuple is visible to a transaction if:
+
+1. `xmin` committed **before** the transaction's snapshot was taken (the inserting transaction is committed and was committed before the snapshot)
+2. `xmax` is 0, **or** `xmax` represents a transaction that was not yet committed at the time the snapshot was taken, **or** `xmax` represents a transaction that aborted
+
+This logic is implemented in `src/backend/access/heap/heapam_visibility.c`. The `HeapTupleSatisfiesMVCC()` function is the core visibility check for standard queries.
+
+### Reading xmin and xmax
+
+```sql
+-- These are the actual system fields stored in every heap tuple
+SELECT xmin, xmax, ctid, * FROM orders LIMIT 5;
+```
+
+```
+ xmin  | xmax  |  ctid  |  id  | status
+-------+-------+--------+------+--------
+  1001 |     0 | (0,1)  |    1 | pending
+  1002 |  1005 | (0,2)  |    2 | shipped   -- xmax set, row was updated/deleted by xact 1005
+  1003 |     0 | (0,3)  |    3 | pending
+```
+
+## Transaction snapshots
+
+When a backend needs to evaluate tuple visibility, it uses a **snapshot** — a record of which transactions were in progress, committed, or aborted at a particular moment.
+
+A snapshot contains:
+- **`xmin`** — the oldest transaction ID that is still active; any transaction with XID < xmin is either committed or aborted
+- **`xmax`** — the next transaction ID that will be assigned; any transaction with XID ≥ xmax is definitely not yet started
+- **`xip`** — the list of transaction IDs that were in progress (between xmin and xmax) at the time the snapshot was taken
+
+A transaction's committed changes are visible to a snapshot if the transaction's XID is less than the snapshot's xmax and not in the xip list (or already committed before the snapshot was taken).
+
+```sql
+-- Inspect the current transaction's snapshot
+SELECT * FROM pg_current_snapshot();
+```
+
+```
+ pg_current_snapshot
+----------------------------
+ 1001:1005:1002,1003
+```
+
+This means: transactions below 1001 are all committed; 1005 is the next XID to be assigned; transactions 1002 and 1003 were in progress when the snapshot was taken.
+
+### Snapshot timing and isolation levels
+
+| Isolation level | When the snapshot is taken |
+|---|---|
+| Read Committed | At the start of **each statement** |
+| Repeatable Read | At the start of the **first non-transaction-control statement** in the transaction |
+| Serializable | Same as Repeatable Read, plus read/write dependency tracking |
+
+In Read Committed mode, two successive `SELECT` statements in the same transaction can see different data because they each take a fresh snapshot.
+
+## INSERT, UPDATE, and DELETE
+
+### INSERT
+
+When a row is inserted, PostgreSQL writes a new tuple with:
+- `t_xmin` = current transaction ID
+- `t_xmax` = 0
+
+The tuple is invisible to other transactions until the inserting transaction commits.
+
+### DELETE
+
+When a row is deleted, PostgreSQL does **not** remove the physical tuple immediately. Instead, it sets:
+- `t_xmax` = current transaction ID
+
+The tuple remains on the heap page until VACUUM reclaims it. Other transactions with snapshots predating the deletion still see the old version.
+
+### UPDATE
+
+An update in PostgreSQL is a combination of delete + insert:
+
+1. The old tuple's `t_xmax` is set to the current transaction ID
+2. A new tuple is inserted with the updated column values and `t_xmin` = current transaction ID
+3. The old tuple's `t_ctid` is updated to point to the new tuple
+
+```sql
+-- Before UPDATE: row (0,1) has xmin=1001, xmax=0
+UPDATE orders SET status = 'shipped' WHERE id = 1;
+-- After UPDATE:
+--   old tuple (0,1): xmin=1001, xmax=<current_xid>, ctid->(0,4)
+--   new tuple (0,4): xmin=<current_xid>, xmax=0
+```
+
+This is why queries on heavily-updated tables can see bloat: old tuple versions accumulate until VACUUM removes them.
+
+## HOT updates
+
+The Heap Only Tuple (HOT) feature eliminates redundant index entries and allows the reuse of space taken by deleted or updated tuples without a full table-wide vacuum (`src/backend/access/heap/README.HOT`).
+
+HOT updates apply when:
+1. The new tuple fits on the **same heap page** as the old tuple, AND
+2. **No indexed column** was modified by the update
+
+When a HOT update is performed, the new tuple is **not** inserted into any indexes. Only the old tuple's `t_ctid` points to the new version. An index search that finds the old tuple follows the chain on the heap page to find the current version.
+
+```
+Index points to line pointer 1
+  lp [1]      [2]
+  [old tuple] --> [new HOT tuple]
+```
+
+When the old tuple is no longer visible to any transaction, its line pointer becomes a **redirecting pointer** that skips directly to the new tuple:
+
+```
+Index points to line pointer 1
+  lp [1] --> [2]
+              [new HOT tuple]
+```
+
+HOT updates significantly reduce index bloat for workloads that repeatedly update non-indexed columns (e.g., updating a `status` or `updated_at` column).
+
+<Tip>
+  To take advantage of HOT updates, ensure that columns that change frequently are not indexed, or use partial indexes that cover only a subset of rows.
+</Tip>
+
+## Hint bits
+
+Checking whether `t_xmin` and `t_xmax` belong to committed or aborted transactions requires looking up the **commit log** (`pg_xact`). To avoid this lookup on every visibility check, PostgreSQL caches the commit/abort status in two hint bits in the tuple header:
+
+- `HEAP_XMIN_COMMITTED` / `HEAP_XMIN_INVALID`: the inserting transaction committed or aborted
+- `HEAP_XMAX_COMMITTED` / `HEAP_XMAX_INVALID`: the deleting transaction committed or aborted
+
+When a backend first sees a tuple and determines the status of its `xmin` or `xmax`, it sets the appropriate hint bit. This is technically a modification to the page, so the backend calls `MarkBufferDirtyHint()` — a lightweight form of page modification that does not require a WAL record in most cases.
+
+## Transaction ID wraparound and VACUUM
+
+PostgreSQL uses 32-bit transaction IDs. After about 2 billion transactions, the XID counter wraps around. Without intervention, a transaction with a wrapped XID would appear to be in the future, making all previously visible tuples invisible.
+
+To prevent this, PostgreSQL uses **transaction ID freezing**: VACUUM periodically replaces old `xmin` values with the special "frozen" transaction ID (`FrozenTransactionId = 2`), which is defined to be visible to all transactions regardless of their snapshot.
+
+The `autovacuum` daemon automatically freezes tuples when a table's oldest unfrozen XID is within `autovacuum_freeze_max_age` (default: 200 million) transactions of the wraparound point.
+
+```sql
+-- Check which tables are furthest from XID wraparound
+SELECT relname,
+       age(relfrozenxid) AS xid_age,
+       pg_size_pretty(pg_total_relation_size(oid)) AS total_size
+FROM pg_class
+WHERE relkind = 'r'
+ORDER BY age(relfrozenxid) DESC
+LIMIT 10;
+```
+
+## VACUUM
+
+`VACUUM` is the mechanism that reclaims space occupied by dead tuples — tuples whose `xmax` was set by a committed transaction and that are no longer visible to any active snapshot.
+
+<AccordionGroup>
+  <Accordion title="Regular VACUUM">
+    Regular (non-full) VACUUM reclaims dead tuple space for reuse **within the same table**. It does not return space to the operating system. It also:
+
+    - Updates the visibility map (marking pages as all-visible or all-frozen)
+    - Updates free space map entries
+    - Freezes old transaction IDs to prevent wraparound
+    - Updates `pg_class.relfrozenxid` and `pg_class.relminmxid`
+
+    ```sql
+    VACUUM orders;
+    VACUUM VERBOSE orders;  -- shows detailed statistics
+    VACUUM ANALYZE orders;  -- also updates column statistics
+    ```
+  </Accordion>
+  <Accordion title="VACUUM FULL">
+    `VACUUM FULL` rewrites the entire table into a new heap file, actually returning disk space to the operating system. It acquires an `ACCESS EXCLUSIVE` lock on the table for the duration, blocking all reads and writes.
+
+    ```sql
+    VACUUM FULL orders;
+    ```
+
+    Use `VACUUM FULL` only when a table has shrunk substantially and you need to recover disk space. For routine maintenance, prefer regular `VACUUM`.
+  </Accordion>
+  <Accordion title="Autovacuum">
+    The autovacuum daemon (`src/backend/postmaster/autovacuum.c`) automatically runs `VACUUM` and `ANALYZE` on tables based on configurable thresholds. A table triggers autovacuum when:
+
+    ```
+    dead tuples > autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * reltuples
+    ```
+
+    The default values are `autovacuum_vacuum_threshold = 50` and `autovacuum_vacuum_scale_factor = 0.2`, so autovacuum triggers after roughly 20% of rows become dead.
+
+    ```sql
+    -- Inspect autovacuum activity
+    SELECT relname,
+           n_dead_tup,
+           last_autovacuum,
+           last_autoanalyze
+    FROM pg_stat_user_tables
+    ORDER BY n_dead_tup DESC
+    LIMIT 10;
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Table bloat
+
+In a write-heavy workload, tables and indexes can accumulate **bloat**: space occupied by dead tuples or index entries for deleted rows that have not yet been reclaimed by VACUUM.
+
+Estimate table bloat:
+
+```sql
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) AS total_size,
+    n_dead_tup,
+    n_live_tup,
+    round(100 * n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct
+FROM pg_stat_user_tables
+WHERE n_live_tup > 0
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+```
+
+If autovacuum is not keeping up with bloat on a high-traffic table, consider:
+
+- Lowering `autovacuum_vacuum_scale_factor` for that table: `ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.05);`
+- Running manual `VACUUM` during maintenance windows
+- Using `pg_repack` (extension) to reclaim space without an exclusive lock

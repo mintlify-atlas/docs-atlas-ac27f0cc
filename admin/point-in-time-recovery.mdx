@@ -1,0 +1,211 @@
+---
+title: Point-in-time recovery
+description: Configure WAL archiving to enable point-in-time recovery (PITR), create a base backup, set recovery targets by time, LSN, name, or XID, and use standby.signal and recovery.signal.
+---
+
+Point-in-time recovery (PITR) lets you restore a PostgreSQL cluster to any state after a base backup was taken, by replaying archived WAL segments up to a specified target. This is useful for undoing accidental data deletion, recovering from corruption, or creating database snapshots at historical points.
+
+## How PITR works
+
+1. A base backup captures a consistent snapshot of the data directory.
+2. WAL archiving continuously saves completed WAL segments to a separate location.
+3. To recover, you restore the base backup and then replay WAL segments up to the desired target (a timestamp, LSN, transaction ID, or named restore point).
+
+## Step 1: enable WAL archiving
+
+Add these settings to `postgresql.conf` **before** taking the base backup:
+
+```ini postgresql.conf
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /mnt/wal_archive/%f && cp %p /mnt/wal_archive/%f'
+```
+
+Restart the server for `archive_mode` and `wal_level` to take effect (they require restart).
+
+Verify archiving is active:
+
+```sql
+SELECT archived_count, last_archived_wal, last_archived_time
+FROM pg_stat_archiver;
+```
+
+## Step 2: take a base backup
+
+```bash
+pg_basebackup -h localhost -U replicator \
+  -D /mnt/base_backup \
+  -P --wal-method=stream
+```
+
+Record the time of the backup or create a named restore point immediately after:
+
+```sql
+-- Create a labeled restore point (returns the current LSN)
+SELECT pg_create_restore_point('before_migration_20260315');
+```
+
+## Step 3: prepare the recovery
+
+To recover, first stop any running server, then replace the data directory with the base backup:
+
+```bash
+# Stop the running server
+pg_ctl stop -D /var/lib/pgsql/data -m fast
+
+# Back up the current data directory (safety measure)
+mv /var/lib/pgsql/data /var/lib/pgsql/data.broken
+
+# Restore the base backup
+cp -a /mnt/base_backup /var/lib/pgsql/data
+
+# Ensure permissions are correct
+chown -R postgres:postgres /var/lib/pgsql/data
+chmod 700 /var/lib/pgsql/data
+```
+
+## Step 4: configure recovery
+
+Create a `recovery.signal` file in the data directory to tell PostgreSQL to enter recovery mode:
+
+```bash
+touch /var/lib/pgsql/data/recovery.signal
+```
+
+Add recovery settings to `postgresql.conf`:
+
+```ini postgresql.conf
+# Command to retrieve archived WAL segments
+restore_command = 'cp /mnt/wal_archive/%f %p'
+
+# Recovery target (choose one of the options below)
+recovery_target_time = '2026-03-15 14:00:00 UTC'
+```
+
+<Note>
+  In PostgreSQL 12+, recovery settings are placed in `postgresql.conf` (or `postgresql.auto.conf`). The former `recovery.conf` file is no longer used.
+</Note>
+
+## Recovery targets
+
+Choose the recovery target that best describes the desired endpoint.
+
+<AccordionGroup>
+  <Accordion title="Time (recovery_target_time)">
+    Stop recovery at a specific timestamp.
+
+    ```ini
+    recovery_target_time = '2026-03-15 14:00:00 UTC'
+    recovery_target_inclusive = on   # include transactions committed exactly at target
+    ```
+  </Accordion>
+
+  <Accordion title="Named restore point (recovery_target_name)">
+    Stop at a restore point created with `pg_create_restore_point()`.
+
+    ```ini
+    recovery_target_name = 'before_migration_20260315'
+    ```
+  </Accordion>
+
+  <Accordion title="LSN (recovery_target_lsn)">
+    Stop at a specific write-ahead log location.
+
+    ```ini
+    recovery_target_lsn = '0/15D68C0'
+    ```
+  </Accordion>
+
+  <Accordion title="Transaction ID (recovery_target_xid)">
+    Stop after a specific transaction commits.
+
+    ```ini
+    recovery_target_xid = '1234567'
+    ```
+  </Accordion>
+
+  <Accordion title="Immediate">
+    Stop as soon as a consistent state is reached (equivalent to the end of the base backup).
+
+    ```ini
+    recovery_target = 'immediate'
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Recovery target action
+
+After reaching the target, control what happens next:
+
+```ini postgresql.conf
+# pause: hold at recovery target (default; allows inspection before promoting)
+recovery_target_action = 'pause'
+
+# promote: open the server for read/write (no more WAL replay)
+recovery_target_action = 'promote'
+
+# shutdown: shut down after reaching the target
+recovery_target_action = 'shutdown'
+```
+
+## standby.signal vs recovery.signal
+
+| Signal file | Behavior |
+|-------------|----------|
+| `recovery.signal` | Server enters recovery mode, applies WAL to the target, then promotes to a normal read/write server. |
+| `standby.signal` | Server enters standby (continuous recovery) mode, keeps applying WAL indefinitely. Used for replicas. |
+
+If both files are present, `standby.signal` takes precedence.
+
+## Step 5: start recovery
+
+```bash
+pg_ctl start -D /var/lib/pgsql/data -l /var/log/postgresql/recovery.log
+```
+
+Monitor the log. You will see messages like:
+
+```
+LOG:  starting point-in-time recovery to 2026-03-15 14:00:00+00
+LOG:  restored log file "000000010000000000000001" from archive
+LOG:  recovery stopping before commit of transaction 1234600, time 2026-03-15 14:00:05+00
+LOG:  pausing at the end of recovery
+HINT:  Execute pg_wal_replay_resume() to promote.
+```
+
+If `recovery_target_action = 'pause'`, inspect the database and then promote:
+
+```sql
+SELECT pg_wal_replay_resume();
+```
+
+## Inspecting WAL with pg_waldump
+
+`pg_waldump` decodes WAL segment files, which is useful for diagnosing what transactions are in the WAL before choosing a recovery target:
+
+```bash
+# Decode a specific WAL segment
+pg_waldump /mnt/wal_archive/000000010000000000000005
+
+# Decode a range of WAL from start to end LSN
+pg_waldump --start=0/15D68C0 --end=0/15D9000 /mnt/wal_archive/
+
+# Show only records for a specific relation OID
+pg_waldump --relation=12345 /mnt/wal_archive/000000010000000000000005
+```
+
+<Warning>
+  `pg_waldump` is a low-level diagnostic tool. The output format is not stable across versions. Use it for investigation, not in automated scripts.
+</Warning>
+
+## Timeline handling
+
+Each recovery that produces a promoted server creates a new **timeline**. Subsequent backups and WAL segments belong to the new timeline. The `recovery_target_timeline` parameter controls which timeline to follow during recovery:
+
+```ini
+# Follow the latest available timeline (default; recommended for standbys)
+recovery_target_timeline = 'latest'
+
+# Recover to a specific historical timeline
+recovery_target_timeline = '1'
+```

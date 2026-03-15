@@ -1,0 +1,263 @@
+---
+title: 'Full-text search'
+description: 'tsvector, tsquery, to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, websearch_to_tsquery, @@ operator, ts_rank, ts_headline, GIN/GiST indexes, and text search configurations in PostgreSQL.'
+---
+
+Full-text search (FTS) in PostgreSQL provides linguistic preprocessing, ranking, and fast indexed search of natural-language text. It is more capable than `LIKE` or regular expressions because it handles stemming, stop words, and relevance ranking.
+
+## Core data types
+
+| Type | Description |
+|---|---|
+| `tsvector` | A preprocessed document: sorted list of normalized lexemes with optional positional information |
+| `tsquery` | A search query: lexemes combined with Boolean operators and phrase-distance operators |
+
+## The match operator
+
+The `@@` operator returns `true` when a `tsvector` matches a `tsquery`.
+
+```sql
+-- Direct match (no normalization)
+SELECT 'a fat cat sat on a mat and ate a fat rat'::tsvector @@ 'cat & rat'::tsquery;
+-- t
+
+-- With normalization (recommended for queries against real text)
+SELECT to_tsvector('fat cats ate fat rats') @@ to_tsquery('fat & rat');
+-- t
+
+-- Note: without to_tsvector, 'rats' does not match 'rat'
+SELECT 'fat cats ate fat rats'::tsvector @@ to_tsquery('rat');
+-- f
+```
+
+## to_tsvector
+
+Parses and normalizes a text document into a `tsvector`. The first argument is the text search configuration (language).
+
+```sql
+SELECT to_tsvector('english', 'The fat cats ate the rats');
+-- 'ate':4 'cat':3 'fat':2 'rat':6
+-- stop words ('the') removed, words stemmed
+
+-- Multiple fields (concatenate with weights)
+SELECT to_tsvector('english', title) ||
+       to_tsvector('english', body) AS document
+FROM articles
+LIMIT 1;
+```
+
+## Query construction functions
+
+<Tabs>
+  <Tab title="to_tsquery">
+
+```sql
+-- Requires properly normalized lexemes; use boolean operators: & | ! <->
+SELECT to_tsquery('english', 'cat & rat');
+-- 'cat' & 'rat'
+
+SELECT to_tsquery('english', 'super:*');  -- prefix matching
+-- 'super':*
+```
+
+  </Tab>
+  <Tab title="plainto_tsquery">
+
+```sql
+-- Converts plain text to AND-joined query; no special operators needed
+SELECT plainto_tsquery('english', 'fat cats eating rats');
+-- 'fat' & 'cat' & 'eat' & 'rat'
+```
+
+  </Tab>
+  <Tab title="phraseto_tsquery">
+
+```sql
+-- Words must appear adjacent and in order
+SELECT phraseto_tsquery('english', 'cat in the hat');
+-- 'cat' <-> 'hat'  (stop words removed, remaining words must be adjacent)
+```
+
+  </Tab>
+  <Tab title="websearch_to_tsquery">
+
+```sql
+-- Web-search-like syntax: quoted phrases, - for NOT, OR
+SELECT websearch_to_tsquery('english', '"fat cat" OR rat -mouse');
+-- ( 'fat' <-> 'cat' ) | 'rat' & !'mous'
+```
+
+  </Tab>
+</Tabs>
+
+## Stored tsvector column
+
+For performance, store the `tsvector` as a generated column and index it:
+
+```sql
+CREATE TABLE articles (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title   text NOT NULL,
+    body    text,
+    fts     tsvector GENERATED ALWAYS AS (
+                to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))
+            ) STORED
+);
+
+CREATE INDEX idx_articles_fts ON articles USING GIN (fts);
+
+-- Query the index
+SELECT title FROM articles
+WHERE fts @@ plainto_tsquery('english', 'postgresql performance');
+```
+
+## Searching across multiple columns with weights
+
+Assign weights (A, B, C, D — descending importance) to different fields to influence ranking:
+
+```sql
+SELECT id, title
+FROM articles
+WHERE (
+    setweight(to_tsvector('english', title), 'A') ||
+    setweight(to_tsvector('english', coalesce(abstract, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(body, '')), 'C')
+) @@ plainto_tsquery('english', 'postgresql index');
+```
+
+## Ranking results
+
+### ts_rank
+
+`ts_rank` computes a relevance score based on term frequency.
+
+```sql
+SELECT
+    title,
+    ts_rank(fts, query) AS rank
+FROM articles,
+     plainto_tsquery('english', 'postgresql performance') AS query
+WHERE fts @@ query
+ORDER BY rank DESC
+LIMIT 10;
+```
+
+### ts_rank_cd
+
+`ts_rank_cd` considers term density in addition to frequency, giving higher scores when query terms appear close together.
+
+```sql
+SELECT
+    title,
+    ts_rank_cd(fts, query, 32) AS rank  -- 32 = normalize by document length
+FROM articles,
+     plainto_tsquery('english', 'database indexing') AS query
+WHERE fts @@ query
+ORDER BY rank DESC;
+```
+
+## ts_headline
+
+`ts_headline` returns a snippet of the original text with query terms highlighted.
+
+```sql
+SELECT
+    title,
+    ts_headline(
+        'english',
+        body,
+        plainto_tsquery('english', 'postgresql performance'),
+        'MaxWords=50, MinWords=20, ShortWord=3, HighlightAll=false,
+         MaxFragments=3, FragmentDelimiter=" ... "'
+    ) AS snippet
+FROM articles
+WHERE fts @@ plainto_tsquery('english', 'postgresql performance')
+ORDER BY ts_rank(fts, plainto_tsquery('english', 'postgresql performance')) DESC
+LIMIT 5;
+```
+
+## GIN vs GiST indexes for FTS
+
+```sql
+-- GIN: faster lookup, slower update, larger size
+CREATE INDEX idx_articles_fts_gin ON articles USING GIN (fts);
+
+-- GiST: faster update, slower lookup, supports KNN
+CREATE INDEX idx_articles_fts_gist ON articles USING GIST (fts);
+```
+
+| | GIN | GiST |
+|---|---|---|
+| Lookup speed | Faster | Slower |
+| Build/update speed | Slower | Faster |
+| Index size | Larger | Smaller |
+
+<Tip>
+For read-heavy workloads, use GIN. For write-heavy workloads where FTS queries are less frequent, GiST may be a better choice.
+</Tip>
+
+## Text search configurations
+
+A text search configuration specifies the parser and dictionaries to use. The default is `pg_catalog.english`.
+
+```sql
+-- List available configurations
+SELECT cfgname FROM pg_ts_config;
+
+-- Use a specific configuration
+SELECT to_tsvector('french', 'les chats mangent les souris');
+-- 'chat':2 'mang':3 'souris':5
+
+-- View the current default
+SHOW default_text_search_config;
+
+-- Set session default
+SET default_text_search_config = 'pg_catalog.german';
+```
+
+### Dictionaries
+
+Dictionaries normalize tokens. Common built-in dictionary types:
+
+| Dictionary | Purpose |
+|---|---|
+| `simple` | Lowercase only, no stemming |
+| `synonym` | Replace words with synonyms |
+| `thesaurus` | Richer synonym mapping |
+| `ispell` | Full morphological analysis |
+| `snowball` | Stemming (many languages) |
+| `stop` | Remove stop words |
+
+## Complete example
+
+```sql
+CREATE TABLE documents (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title   text NOT NULL,
+    content text,
+    author  text,
+    fts     tsvector GENERATED ALWAYS AS (
+                setweight(to_tsvector('english', coalesce(title, '')),   'A') ||
+                setweight(to_tsvector('english', coalesce(author, '')),  'B') ||
+                setweight(to_tsvector('english', coalesce(content, '')), 'C')
+            ) STORED
+);
+
+CREATE INDEX idx_documents_fts ON documents USING GIN (fts);
+
+INSERT INTO documents (title, content, author) VALUES
+    ('PostgreSQL Performance Tips', 'Index usage and query planning ...', 'Alice'),
+    ('Understanding JSONB', 'Binary JSON storage and operators ...', 'Bob'),
+    ('Full Text Search in Postgres', 'tsvector, tsquery, and ranking ...', 'Alice');
+
+-- Search
+SELECT
+    id,
+    title,
+    author,
+    ts_rank(fts, query) AS relevance
+FROM documents,
+     websearch_to_tsquery('english', 'postgresql index OR ranking') AS query
+WHERE fts @@ query
+ORDER BY relevance DESC;
+```

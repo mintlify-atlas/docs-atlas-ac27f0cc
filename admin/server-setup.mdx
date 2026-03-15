@@ -1,0 +1,236 @@
+---
+title: Server setup and operation
+description: Initialize a PostgreSQL database cluster, configure key files, manage the server with pg_ctl, set up a systemd service, and connect using environment variables and connection strings.
+---
+
+## Prerequisites
+
+Before running any PostgreSQL commands, create a dedicated operating system user account. Running the server as `root` or a shared account is unsafe. The conventional name is `postgres`.
+
+```bash
+useradd -m -s /bin/bash postgres
+```
+
+The `postgres` OS user should own the data directory but **not** the PostgreSQL binary files. This limits the damage a compromised server process can do.
+
+## Creating a database cluster
+
+A **database cluster** is a collection of databases managed by a single PostgreSQL server instance. Before using PostgreSQL you must initialize a cluster with `initdb`.
+
+<Steps>
+  <Step title="Create the data directory">
+    As `root`, create a directory and hand it to the `postgres` OS user:
+
+    ```bash
+    mkdir -p /var/lib/pgsql/data
+    chown postgres /var/lib/pgsql/data
+    ```
+  </Step>
+
+  <Step title="Run initdb">
+    Switch to the `postgres` user and initialize:
+
+    ```bash
+    su - postgres
+    initdb -D /var/lib/pgsql/data
+    ```
+
+    Alternatively, set `PGDATA` and omit `-D`:
+
+    ```bash
+    export PGDATA=/var/lib/pgsql/data
+    initdb
+    ```
+
+    `initdb` refuses to run if the target directory already contains files, protecting against accidental overwrites.
+  </Step>
+
+  <Step title="(Optional) Set a superuser password">
+    By default, `initdb` uses `trust` authentication for local connections. To require a password from the start:
+
+    ```bash
+    initdb -D /var/lib/pgsql/data -A scram-sha-256 --pwprompt
+    ```
+
+    You can also pass a password file with `--pwfile`.
+  </Step>
+</Steps>
+
+After initialization, `initdb` creates three databases: `postgres` (default utility database), `template1`, and `template0`. It also creates `postgresql.conf` and `pg_hba.conf` in the data directory.
+
+<Tip>
+  Use the `PGDATA` environment variable instead of typing `-D` on every command. Export it in the `postgres` user's shell profile.
+</Tip>
+
+## Key configuration files
+
+| File | Purpose |
+|------|---------||
+| `$PGDATA/postgresql.conf` | Server GUC parameters |
+| `$PGDATA/pg_hba.conf` | Client authentication rules |
+| `$PGDATA/pg_ident.conf` | OS-to-database user name maps |
+| `$PGDATA/postgresql.auto.conf` | Settings applied by `ALTER SYSTEM` (do not edit manually) |
+
+`postgresql.auto.conf` is read after `postgresql.conf` and its settings take precedence.
+
+## Starting and stopping with pg_ctl
+
+`pg_ctl` is the recommended wrapper for managing the server process.
+
+<CodeGroup>
+```bash start
+pg_ctl start -D /var/lib/pgsql/data -l /var/log/postgresql/server.log
+```
+
+```bash stop
+# Fast shutdown (in-progress transactions are rolled back)
+pg_ctl stop -D /var/lib/pgsql/data -m fast
+
+# Smart shutdown (waits for all clients to disconnect)
+pg_ctl stop -D /var/lib/pgsql/data -m smart
+
+# Immediate shutdown (dirty, requires crash recovery on next start)
+pg_ctl stop -D /var/lib/pgsql/data -m immediate
+```
+
+```bash reload
+# Reload postgresql.conf without restarting
+pg_ctl reload -D /var/lib/pgsql/data
+```
+
+```bash status
+pg_ctl status -D /var/lib/pgsql/data
+```
+</CodeGroup>
+
+While the server runs, its PID is stored in `$PGDATA/postmaster.pid`. This prevents multiple instances from sharing the same data directory.
+
+<Warning>
+  Never run `postgres` or `pg_ctl` as `root`. The server must run as the `postgres` (or equivalent) OS user.
+</Warning>
+
+## systemd service setup
+
+On Linux systems using systemd, create a service unit file at `/etc/systemd/system/postgresql.service`:
+
+```ini /etc/systemd/system/postgresql.service
+[Unit]
+Description=PostgreSQL database server
+Documentation=man:postgres(1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=postgres
+ExecStart=/usr/local/pgsql/bin/postgres -D /var/lib/pgsql/data
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGINT
+Restart=on-failure
+TimeoutSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+```
+
+<Note>
+  `Type=notify` requires PostgreSQL to be compiled with `--with-systemd`. Set `TimeoutSec=infinity` because crash recovery at startup can take much longer than systemd's default 90-second timeout.
+</Note>
+
+Enable and start the service:
+
+```bash
+systemctl daemon-reload
+systemctl enable postgresql
+systemctl start postgresql
+```
+
+## Environment variables
+
+These environment variables are recognized by PostgreSQL client programs and `pg_ctl`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PGDATA` | — | Path to the data directory |
+| `PGHOST` | `/tmp` (Unix socket) | Server host or socket directory |
+| `PGPORT` | `5432` | TCP port |
+| `PGUSER` | OS username | Database role to connect as |
+| `PGPASSWORD` | — | Password (use `.pgpass` instead for security) |
+| `PGDATABASE` | Same as `PGUSER` | Default database |
+
+Example shell profile for the `postgres` user:
+
+```bash ~/.bash_profile
+export PGDATA=/var/lib/pgsql/data
+export PGPORT=5432
+export PGUSER=postgres
+```
+
+## Connection strings
+
+PostgreSQL accepts two connection string formats.
+
+**Keyword/value format:**
+
+```
+host=localhost port=5432 dbname=mydb user=alice password=secret
+```
+
+**URI format (libpq URI):**
+
+```
+postgresql://alice:secret@localhost:5432/mydb
+```
+
+Additional parameters can be appended as query string arguments:
+
+```
+postgresql://alice@localhost/mydb?sslmode=require&connect_timeout=10
+```
+
+<Tabs>
+  <Tab title="psql">
+    ```bash
+    psql "postgresql://alice@localhost:5432/mydb"
+    # or
+    psql -h localhost -p 5432 -U alice mydb
+    ```
+  </Tab>
+  <Tab title="pg_dump">
+    ```bash
+    pg_dump -h localhost -U alice mydb > mydb.sql
+    ```
+  </Tab>
+  <Tab title="Application (libpq)">
+    ```c
+    PGconn *conn = PQconnectdb("host=localhost dbname=mydb user=alice");
+    ```
+  </Tab>
+</Tabs>
+
+## Common startup errors
+
+<AccordionGroup>
+  <Accordion title="Address already in use">
+    ```
+    LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+    HINT:  Is another postmaster already running on port 5432?
+    ```
+    Another PostgreSQL process is already using port 5432. Check with `pg_ctl status` or `ss -tlnp | grep 5432`.
+  </Accordion>
+
+  <Accordion title="Could not create shared memory segment">
+    ```
+    FATAL: could not create shared memory segment: Invalid argument
+    ```
+    The kernel's shared memory limit is smaller than what PostgreSQL needs. Reduce `shared_buffers` temporarily, or increase the kernel `SHMMAX` parameter.
+  </Accordion>
+
+  <Accordion title="Connection refused (client side)">
+    ```
+    psql: error: connection to server at "server.example.com", port 5432 failed: Connection refused
+    ```
+    The server is not listening on the expected address. Verify `listen_addresses` in `postgresql.conf` and that the server is running.
+  </Accordion>
+</AccordionGroup>

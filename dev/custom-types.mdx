@@ -1,0 +1,265 @@
+---
+title: Custom types
+description: Define new PostgreSQL data types using CREATE TYPE. Covers base types with C I/O functions, composite types, domain types, and enum types, with a complete complex number example.
+---
+
+PostgreSQL's type system is extensible. You can define:
+
+<CardGroup cols={2}>
+  <Card title="Base types" icon="cube">
+    Implemented in C with custom I/O functions. The most powerful kind, but requires the most work.
+  </Card>
+  <Card title="Composite types" icon="table-cells">
+    Named row types. Automatically created for every table; also creatable standalone.
+  </Card>
+  <Card title="Domain types" icon="tag">
+    Constrained subtypes of an existing type. Defined entirely in SQL.
+  </Card>
+  <Card title="Enum types" icon="list">
+    Ordered sets of labeled values. Defined entirely in SQL.
+  </Card>
+</CardGroup>
+
+## Base types
+
+A base type is implemented below the SQL level — typically in C. To create one you must write at minimum:
+
+- An **input function**: converts a text representation to the internal form
+- An **output function**: converts the internal form back to text
+
+### Example: a `complex` number type
+
+The internal C representation:
+
+```c
+/* complex.h */
+typedef struct Complex {
+    double  x;  /* real part */
+    double  y;  /* imaginary part */
+} Complex;
+```
+
+Because `Complex` is 16 bytes (larger than a `Datum`), it is passed by reference.
+
+### Input and output functions
+
+```c
+#include "postgres.h"
+#include "fmgr.h"
+#include "utils/builtins.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(complex_in);
+
+Datum
+complex_in(PG_FUNCTION_ARGS)
+{
+    char    *str = PG_GETARG_CSTRING(0);
+    double   x, y;
+    Complex *result;
+
+    if (sscanf(str, " ( %lf , %lf )", &x, &y) != 2)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                 errmsg("invalid input syntax for type %s: \"%s\"",
+                        "complex", str)));
+
+    result = palloc_object(Complex);
+    result->x = x;
+    result->y = y;
+    PG_RETURN_POINTER(result);
+}
+
+PG_FUNCTION_INFO_V1(complex_out);
+
+Datum
+complex_out(PG_FUNCTION_ARGS)
+{
+    Complex *complex = (Complex *) PG_GETARG_POINTER(0);
+    char    *result;
+
+    result = psprintf("(%g,%g)", complex->x, complex->y);
+    PG_RETURN_CSTRING(result);
+}
+```
+
+### Optional: binary I/O
+
+Binary I/O is faster but less portable. It is optional but recommended for types that are frequently transferred:
+
+```c
+PG_FUNCTION_INFO_V1(complex_recv);
+
+Datum
+complex_recv(PG_FUNCTION_ARGS)
+{
+    StringInfo  buf = (StringInfo) PG_GETARG_POINTER(0);
+    Complex    *result;
+
+    result = (Complex *) palloc(sizeof(Complex));
+    result->x = pq_getmsgfloat8(buf);
+    result->y = pq_getmsgfloat8(buf);
+    PG_RETURN_POINTER(result);
+}
+
+PG_FUNCTION_INFO_V1(complex_send);
+
+Datum
+complex_send(PG_FUNCTION_ARGS)
+{
+    Complex        *complex = (Complex *) PG_GETARG_POINTER(0);
+    StringInfoData  buf;
+
+    pq_begintypsend(&buf);
+    pq_sendfloat8(&buf, complex->x);
+    pq_sendfloat8(&buf, complex->y);
+    PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+```
+
+### Registering the type in SQL
+
+Because the input/output functions reference the type, and the type references the functions, you must use a **shell type** as a placeholder:
+
+<Steps>
+  <Step title="Declare the shell type">
+    ```sql
+    CREATE TYPE complex;
+    ```
+  </Step>
+  <Step title="Register the I/O functions">
+    ```sql
+    CREATE FUNCTION complex_in(cstring)
+        RETURNS complex
+        AS '$libdir/complex'
+        LANGUAGE C IMMUTABLE STRICT;
+
+    CREATE FUNCTION complex_out(complex)
+        RETURNS cstring
+        AS '$libdir/complex'
+        LANGUAGE C IMMUTABLE STRICT;
+
+    CREATE FUNCTION complex_recv(internal)
+        RETURNS complex
+        AS '$libdir/complex'
+        LANGUAGE C IMMUTABLE STRICT;
+
+    CREATE FUNCTION complex_send(complex)
+        RETURNS bytea
+        AS '$libdir/complex'
+        LANGUAGE C IMMUTABLE STRICT;
+    ```
+  </Step>
+  <Step title="Define the full type">
+    ```sql
+    CREATE TYPE complex (
+        internallength = 16,
+        input          = complex_in,
+        output         = complex_out,
+        receive        = complex_recv,
+        send           = complex_send,
+        alignment      = double
+    );
+    ```
+  </Step>
+</Steps>
+
+### CREATE TYPE parameters for base types
+
+| Parameter | Description |
+|-----------|-------------|
+| `internallength` | Byte length of the internal form, or `variable` |
+| `input` | Input function (converts `cstring` → type) |
+| `output` | Output function (converts type → `cstring`) |
+| `receive` | Binary receive function (optional) |
+| `send` | Binary send function (optional) |
+| `alignment` | Storage alignment: `char`, `int2`, `int4`, `double` |
+| `storage` | TOAST strategy: `plain`, `external`, `extended`, `main` |
+| `typmod_in` | Type modifier input function |
+| `typmod_out` | Type modifier output function |
+| `analyze` | Custom `ANALYZE` function |
+| `category` | Type category for implicit casting decisions |
+
+### Array types
+
+When you define a new base type, PostgreSQL automatically creates an array type for it. The array type is named by prepending `_` to the base type name (e.g., `_complex`).
+
+### TOAST support
+
+For variable-length types, TOAST allows PostgreSQL to compress or store values out-of-line when they exceed roughly 2 kB. To support TOAST:
+
+1. Set `internallength = variable` in `CREATE TYPE`.
+2. Set `storage` to something other than `plain` (e.g., `extended`).
+3. Always call `PG_DETOAST_DATUM()` (or `PG_GETARG_TEXT_PP()` etc.) before accessing a varlena value.
+
+```c
+/* Never access varlena data without detoasting first */
+text *arg = PG_GETARG_TEXT_PP(0);  /* already detoasted */
+```
+
+## Composite types
+
+Composite types represent named row structures. Every table automatically has an associated composite type. You can also define standalone composite types:
+
+```sql
+CREATE TYPE inventory_item AS (
+    name        text,
+    supplier_id integer,
+    price       numeric
+);
+
+CREATE FUNCTION price_extension(inventory_item, integer)
+    RETURNS numeric AS $$
+    SELECT $1.price * $2;
+$$ LANGUAGE SQL;
+```
+
+Composite type values can be constructed with the `ROW(...)` syntax:
+
+```sql
+SELECT ROW('fuzzy dice', 42, 1.99)::inventory_item;
+```
+
+## Domain types
+
+A domain is a type based on an existing type with added constraints:
+
+```sql
+CREATE DOMAIN positive_int AS integer
+    CHECK (VALUE > 0)
+    NOT NULL;
+
+CREATE DOMAIN us_zip AS char(5)
+    CHECK (VALUE ~ '^\d{5}$');
+
+-- Domains can be stacked
+CREATE DOMAIN non_zero_int AS positive_int
+    CHECK (VALUE != 0);
+```
+
+Domain values behave like the underlying type but are checked against the constraint on every insert or update.
+
+## Enum types
+
+Enum types are ordered sets of labels. They are stored as integers internally but presented as text:
+
+```sql
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+CREATE TABLE person (
+    name  text,
+    current_mood mood
+);
+
+INSERT INTO person VALUES ('Moe', 'happy');
+SELECT * FROM person WHERE current_mood > 'ok';  -- ordered comparison
+```
+
+Enum labels are case-sensitive. The ordering is the order given in `CREATE TYPE`.
+
+To add a new value to an existing enum:
+
+```sql
+ALTER TYPE mood ADD VALUE 'ecstatic' AFTER 'happy';
+```

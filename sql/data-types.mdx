@@ -1,0 +1,335 @@
+---
+title: 'Data types'
+description: 'Complete reference for PostgreSQL built-in data types: numeric, character, boolean, date/time, binary, UUID, arrays, JSON, geometric, network, enum, range, composite, and domain types.'
+---
+
+PostgreSQL provides a rich set of native data types. Users can also define custom types with `CREATE TYPE`.
+
+## Numeric types
+
+<CardGroup cols={2}>
+  <Card title="Integer types">
+    | Type | Storage | Range |
+    |---|---|---|
+    | `smallint` (`int2`) | 2 bytes | −32768 to +32767 |
+    | `integer` (`int`, `int4`) | 4 bytes | −2147483648 to +2147483647 |
+    | `bigint` (`int8`) | 8 bytes | −9223372036854775808 to +9223372036854775807 |
+  </Card>
+  <Card title="Floating-point types">
+    | Type | Storage | Notes |
+    |---|---|---|
+    | `real` (`float4`) | 4 bytes | 6 decimal digits precision |
+    | `double precision` (`float8`, `float`) | 8 bytes | 15 decimal digits precision |
+    | `numeric(p, s)` / `decimal(p, s)` | variable | Exact; up to 131072 digits before decimal |
+  </Card>
+</CardGroup>
+
+```sql
+CREATE TABLE financial (
+    quantity    integer,
+    unit_price  numeric(12, 4),   -- exact decimal
+    tax_rate    real,             -- approximate floating-point
+    total       double precision
+);
+```
+
+### Serial / identity
+
+`serial`, `bigserial`, and `smallserial` are shorthand for creating a sequence and setting the column default. Prefer `GENERATED ... AS IDENTITY` in new code.
+
+```sql
+-- Old style (still common)
+CREATE TABLE legacy (id serial PRIMARY KEY);
+
+-- SQL-standard identity column
+CREATE TABLE modern (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY);
+```
+
+## Character types
+
+| Type | Description |
+|---|---|
+| `character(n)` / `char(n)` | Fixed-length, blank-padded |
+| `character varying(n)` / `varchar(n)` | Variable-length with limit |
+| `text` | Variable-length, no limit |
+
+```sql
+CREATE TABLE labels (
+    code  char(3),         -- always 3 characters, padded with spaces
+    slug  varchar(255),    -- up to 255 characters
+    body  text             -- unlimited
+);
+```
+
+<Tip>
+In PostgreSQL, `text` and `varchar` without a length limit have identical performance. Use `text` unless you specifically need a length constraint.
+</Tip>
+
+## Boolean
+
+The `boolean` type stores `true` / `false` / `NULL`. Accepted input literals include `true`, `false`, `yes`, `no`, `on`, `off`, `1`, `0`.
+
+```sql
+CREATE TABLE feature_flags (
+    feature_name text PRIMARY KEY,
+    enabled      boolean NOT NULL DEFAULT false
+);
+
+INSERT INTO feature_flags VALUES ('dark_mode', true);
+SELECT * FROM feature_flags WHERE enabled;
+```
+
+## Date and time types
+
+| Type | Storage | Description |
+|---|---|---|
+| `date` | 4 bytes | Calendar date (year, month, day) |
+| `time [ (p) ]` | 8 bytes | Time of day, no time zone |
+| `timetz` | 12 bytes | Time of day with time zone |
+| `timestamp [ (p) ]` | 8 bytes | Date and time, no time zone |
+| `timestamptz` | 8 bytes | Date and time, with time zone |
+| `interval [ fields ] [ (p) ]` | 16 bytes | Time span |
+
+```sql
+CREATE TABLE appointments (
+    id           bigint GENERATED ALWAYS AS IDENTITY,
+    scheduled_at timestamptz NOT NULL,
+    duration     interval NOT NULL DEFAULT '1 hour',
+    notes        text
+);
+
+INSERT INTO appointments (scheduled_at, duration)
+VALUES ('2024-06-15 09:00:00+00', '90 minutes');
+
+-- Date arithmetic
+SELECT scheduled_at + duration AS ends_at FROM appointments;
+```
+
+<Note>
+Always store timestamps as `timestamptz` in applications that operate across time zones. PostgreSQL stores the value in UTC and converts it to the session time zone on output.
+</Note>
+
+## Binary data
+
+`bytea` stores arbitrary binary data ("byte arrays"). There is no length limit.
+
+```sql
+CREATE TABLE attachments (
+    id      bigint GENERATED ALWAYS AS IDENTITY,
+    name    text,
+    content bytea
+);
+
+-- Hex format (default in modern PostgreSQL)
+SELECT '\xDEADBEEF'::bytea;
+
+-- Using the escape format
+SELECT E'\\000\\001\\002'::bytea;
+```
+
+## UUID
+
+The `uuid` type stores a 128-bit Universally Unique Identifier as defined by RFC 4122.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE sessions (
+    session_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    integer NOT NULL,
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+<Tip>
+`gen_random_uuid()` is built into PostgreSQL 13+ and does not require the `uuid-ossp` extension.
+</Tip>
+
+## Arrays
+
+Any base type can be used as an array. Append `[]` to the type name.
+
+```sql
+CREATE TABLE contacts (
+    name        text,
+    phone_nos   text[],
+    scores      integer[]
+);
+
+INSERT INTO contacts VALUES ('Alice', ARRAY['+1-555-0100', '+1-555-0101'], ARRAY[95, 87, 92]);
+
+-- Subscript access (1-based)
+SELECT phone_nos[1] FROM contacts WHERE name = 'Alice';
+
+-- Array containment
+SELECT * FROM contacts WHERE scores @> ARRAY[95];
+```
+
+For a full array reference, see [Arrays](/sql/arrays).
+
+## JSON and JSONB
+
+| Type | Notes |
+|---|---|
+| `json` | Stored as exact text copy; reparsed on each access |
+| `jsonb` | Stored in decomposed binary; faster to process; supports GIN indexing |
+
+```sql
+CREATE TABLE products (
+    id         bigint GENERATED ALWAYS AS IDENTITY,
+    attributes jsonb
+);
+
+INSERT INTO products (attributes)
+VALUES ('{"color": "red", "size": "M", "tags": ["sale", "new"]}');
+
+-- Field extraction
+SELECT attributes->>'color' FROM products;
+
+-- Containment
+SELECT * FROM products WHERE attributes @> '{"tags": ["sale"]}';
+```
+
+For a full JSON reference, see [JSON](/sql/json).
+
+## Geometric types
+
+PostgreSQL has native types for two-dimensional geometric objects.
+
+| Type | Description | Example |
+|---|---|---|
+| `point` | A point on a plane | `'(1.5, 2.5)'` |
+| `line` | Infinite line | `'{1,-1,0}'` |
+| `lseg` | Line segment | `'[(0,0),(1,1)]'` |
+| `box` | Rectangular box | `'(1,1),(0,0)'` |
+| `path` | Geometric path (open or closed) | `'[(0,0),(1,1),(2,0)]'` |
+| `polygon` | Closed geometric path | `'((0,0),(1,0),(0.5,1))'` |
+| `circle` | Circle | `'<(0,0),5>'` |
+
+```sql
+CREATE TABLE venues (
+    name     text,
+    location point,
+    boundary polygon
+);
+
+-- Distance between two points
+SELECT point '(0,0)' <-> point '(3,4)';  -- returns 5
+```
+
+## Network address types
+
+| Type | Description |
+|---|---|
+| `inet` | IPv4 or IPv6 host address (with optional subnet) |
+| `cidr` | IPv4 or IPv6 network address (host bits must be zero) |
+| `macaddr` | MAC address (EUI-48) |
+| `macaddr8` | MAC address (EUI-64) |
+
+```sql
+CREATE TABLE network_devices (
+    hostname text,
+    ip_addr  inet,
+    network  cidr,
+    mac      macaddr
+);
+
+INSERT INTO network_devices VALUES (
+    'router-1',
+    '192.168.1.1',
+    '192.168.1.0/24',
+    '08:00:2b:01:02:03'
+);
+
+-- Find devices in a subnet
+SELECT hostname FROM network_devices WHERE ip_addr << '10.0.0.0/8';
+```
+
+## Enum types
+
+Enum types are ordered lists of static labels. Values are stored efficiently (as integers internally) and validated at insert time.
+
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'processing', 'shipped', 'delivered', 'cancelled');
+
+CREATE TABLE orders (
+    id     bigint GENERATED ALWAYS AS IDENTITY,
+    status order_status NOT NULL DEFAULT 'pending'
+);
+
+SELECT * FROM orders WHERE status = 'pending';
+
+-- Add a value to an existing enum (no table rewrite required)
+ALTER TYPE order_status ADD VALUE 'returned' AFTER 'delivered';
+```
+
+## Range types
+
+Range types represent a range of values of a subtype. Built-in range types include `int4range`, `int8range`, `numrange`, `daterange`, `tsrange`, and `tstzrange`.
+
+```sql
+CREATE TABLE reservations (
+    room_no integer,
+    during  tstzrange
+);
+
+INSERT INTO reservations VALUES (101, '[2024-06-15 14:00+00, 2024-06-15 16:00+00)');
+
+-- Find overlapping reservations
+SELECT * FROM reservations WHERE during && '[2024-06-15 15:00+00, 2024-06-15 17:00+00)';
+```
+
+For a full range type reference, see [Range types](/sql/range-types).
+
+## Composite types
+
+Composite types represent the structure of a row. Every table automatically creates a composite type of the same name.
+
+```sql
+CREATE TYPE address AS (
+    street text,
+    city   text,
+    zip    char(5)
+);
+
+CREATE TABLE customers (
+    id      bigint GENERATED ALWAYS AS IDENTITY,
+    name    text,
+    mailing address
+);
+
+INSERT INTO customers (name, mailing)
+VALUES ('Alice', ROW('123 Main St', 'Springfield', '62701'));
+
+-- Access a field of a composite column
+SELECT (mailing).city FROM customers;
+```
+
+## Domain types
+
+Domains are user-defined types based on an existing type, with optional constraints.
+
+```sql
+CREATE DOMAIN us_zip AS char(5)
+    CHECK (VALUE ~ '^[0-9]{5}$');
+
+CREATE DOMAIN positive_numeric AS numeric
+    CHECK (VALUE > 0);
+
+CREATE TABLE products (
+    id    bigint GENERATED ALWAYS AS IDENTITY,
+    price positive_numeric NOT NULL
+);
+```
+
+## Other notable types
+
+| Type | Description |
+|---|---|
+| `money` | Currency amount (locale-aware formatting) |
+| `bit(n)` | Fixed-length bit string |
+| `bit varying(n)` / `varbit(n)` | Variable-length bit string |
+| `tsvector` | Text search document |
+| `tsquery` | Text search query |
+| `xml` | XML data |
+| `pg_lsn` | PostgreSQL log sequence number |

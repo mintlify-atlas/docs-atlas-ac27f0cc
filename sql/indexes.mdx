@@ -1,0 +1,249 @@
+---
+title: 'Indexes'
+description: 'B-tree, Hash, GiST, GIN, SP-GiST, and BRIN index types in PostgreSQL. Partial indexes, expression indexes, covering indexes with INCLUDE, and index-only scans.'
+---
+
+Indexes allow PostgreSQL to find rows much faster than a sequential scan. Each index type is optimized for a different access pattern.
+
+## CREATE INDEX syntax
+
+```sql
+-- Default B-tree index
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+
+-- Specify index type explicitly
+CREATE INDEX idx_docs_content ON documents USING GIN (content);
+
+-- Unique index
+CREATE UNIQUE INDEX idx_products_sku ON products (sku);
+
+-- Multi-column index
+CREATE INDEX idx_events_user_ts ON events (user_id, created_at DESC);
+
+-- Build without blocking writes (takes longer)
+CREATE INDEX CONCURRENTLY idx_large_table ON large_table (col1);
+```
+
+<Warning>
+By default, `CREATE INDEX` blocks writes to the table for the duration of the build. Use `CONCURRENTLY` in production to avoid blocking, but be aware that concurrent builds can fail and leave an invalid index that must be dropped manually.
+</Warning>
+
+## Index types
+
+### B-tree
+
+B-tree is the default and handles the widest range of queries. It supports the operators `<`, `<=`, `=`, `>=`, `>`, `BETWEEN`, `IN`, `IS NULL`, and `IS NOT NULL`. B-tree is also the only index type that can satisfy `ORDER BY` without a sort step.
+
+```sql
+CREATE INDEX idx_products_price ON products (price);
+
+-- These queries can use the index
+SELECT * FROM products WHERE price = 9.99;
+SELECT * FROM products WHERE price BETWEEN 5 AND 20;
+SELECT * FROM products ORDER BY price LIMIT 10;
+```
+
+B-tree also supports prefix `LIKE` and `~` patterns anchored to the beginning of the string:
+
+```sql
+-- Can use a B-tree index if the locale is C, or with a text_pattern_ops operator class
+SELECT * FROM products WHERE name LIKE 'Widget%';
+```
+
+For case-insensitive prefix matching, use an expression index:
+
+```sql
+CREATE INDEX idx_products_lower_name ON products (lower(name));
+SELECT * FROM products WHERE lower(name) LIKE 'widget%';
+```
+
+### Hash
+
+Hash indexes store a 32-bit hash code and only support equality comparisons (`=`). They are smaller than B-tree for equality-only workloads.
+
+```sql
+CREATE INDEX idx_sessions_token ON sessions USING HASH (token);
+
+SELECT * FROM sessions WHERE token = 'abc123';  -- uses hash index
+SELECT * FROM sessions WHERE token > 'abc123'; -- cannot use hash index
+```
+
+### GiST
+
+GiST (Generalized Search Tree) is an infrastructure for custom indexing strategies. It supports geometric operators, range types, full-text search, and nearest-neighbor queries.
+
+```sql
+-- Geometric types
+CREATE INDEX idx_locations_point ON locations USING GIST (location);
+
+-- Nearest-neighbor (KNN) search
+SELECT * FROM locations
+ORDER BY location <-> point '(101,456)'
+LIMIT 10;
+
+-- Range type overlap
+CREATE INDEX idx_bookings_during ON bookings USING GIST (during);
+SELECT * FROM bookings WHERE during && '[2024-06-01, 2024-07-01)'::daterange;
+
+-- Full-text search
+CREATE INDEX idx_docs_fts ON documents USING GIST (to_tsvector('english', body));
+```
+
+GiST operators (geometric): `<<`, `&<`, `&>`, `>>`, `<<|`, `&<|`, `|&>`, `|>>`, `@>`, `<@`, `~=`, `&&`.
+
+### SP-GiST
+
+SP-GiST (Space-Partitioned GiST) supports non-balanced data structures such as quadtrees, k-d trees, and radix trees. It is suitable for data with natural clustering (IP ranges, text prefixes).
+
+```sql
+CREATE INDEX idx_ips_addr ON network_log USING SPGIST (ip_address);
+```
+
+SP-GiST operators (2D points): `<<`, `>>`, `~=`, `<@`, `<<|`, `|>>`.
+
+### GIN
+
+GIN (Generalized Inverted Index) is an inverted index: it stores a separate entry for each component value. Ideal for arrays, JSONB, and full-text search where a document contains multiple values.
+
+```sql
+-- Array containment
+CREATE INDEX idx_articles_tags ON articles USING GIN (tags);
+SELECT * FROM articles WHERE tags @> ARRAY['postgresql', 'performance'];
+
+-- JSONB
+CREATE INDEX idx_products_attrs ON products USING GIN (attributes);
+SELECT * FROM products WHERE attributes @> '{"color": "red"}';
+
+-- Full-text search
+CREATE INDEX idx_articles_fts ON articles
+    USING GIN (to_tsvector('english', title || ' ' || body));
+```
+
+GIN operators (arrays): `<@`, `@>`, `=`, `&&`.
+
+<Tip>
+GIN indexes are larger and slower to build than GiST, but faster to query for containment and membership tests. For full-text search, GIN is generally preferred over GiST.
+</Tip>
+
+### BRIN
+
+BRIN (Block Range Index) stores summaries (min/max) of values in contiguous physical block ranges. Very small index, effective when column values correlate with physical row order (e.g., an auto-incrementing ID or a timestamp column on an append-only table).
+
+```sql
+CREATE INDEX idx_events_ts ON events USING BRIN (created_at);
+
+SELECT * FROM events WHERE created_at > '2024-01-01';
+```
+
+BRIN supports: `<`, `<=`, `=`, `>=`, `>`.
+
+<Note>
+BRIN indexes provide a significant space savings over B-tree for large, naturally ordered tables, but are much less precise — the planner may still read many blocks that contain no matching rows.
+</Note>
+
+## Index type comparison
+
+| Index | Best for | Operators |
+|---|---|---|
+| B-tree | Ordered data, ranges, equality, sorting | `<`, `<=`, `=`, `>=`, `>` |
+| Hash | Equality only | `=` |
+| GiST | Geometric, range, FTS, nearest-neighbor | Various (operator class) |
+| SP-GiST | Clustered/partitioned data, IP prefixes | Various (operator class) |
+| GIN | Arrays, JSONB, FTS (multi-value columns) | `@>`, `<@`, `&&`, `@@` |
+| BRIN | Ordered append-only large tables | `<`, `<=`, `=`, `>=`, `>` |
+
+## Expression indexes
+
+An index can be built on any expression, not just a column. The expression is evaluated at insert/update time and stored.
+
+```sql
+-- Case-insensitive lookup
+CREATE INDEX idx_users_email_lower ON users (lower(email));
+SELECT * FROM users WHERE lower(email) = 'alice@example.com';
+
+-- Index on concatenation
+CREATE INDEX idx_people_full_name ON people ((first_name || ' ' || last_name));
+SELECT * FROM people WHERE (first_name || ' ' || last_name) = 'John Smith';
+```
+
+## Partial indexes
+
+A partial index covers only the rows that satisfy a `WHERE` predicate. This makes the index smaller and can improve query speed when the indexed subset is small.
+
+```sql
+-- Index only unbilled orders
+CREATE INDEX idx_orders_unbilled ON orders (order_nr)
+    WHERE billed IS NOT TRUE;
+
+SELECT * FROM orders WHERE billed IS NOT TRUE AND order_nr < 10000;
+
+-- Partial unique index: at most one successful test per (subject, target)
+CREATE UNIQUE INDEX idx_tests_success ON tests (subject, target)
+    WHERE success;
+
+-- Exclude internal IPs from index
+CREATE INDEX idx_access_log_ip ON access_log (client_ip)
+    WHERE NOT (client_ip >> inet '192.168.0.0/16');
+```
+
+## Covering indexes (INCLUDE)
+
+The `INCLUDE` clause adds non-key columns to the index as payload. These columns are not used for index searches but allow index-only scans when the query only needs columns stored in the index.
+
+```sql
+-- Without INCLUDE: a query for (x, y) must visit the heap to get y
+CREATE INDEX idx_tab_x ON tab (x);
+
+-- With INCLUDE: the planner can do an index-only scan for SELECT y WHERE x = 'key'
+CREATE INDEX idx_tab_x_covering ON tab (x) INCLUDE (y);
+
+SELECT y FROM tab WHERE x = 'key';  -- index-only scan
+```
+
+Only B-tree, GiST, and SP-GiST support the `INCLUDE` clause.
+
+## Index-only scans
+
+An index-only scan returns results directly from the index without accessing the heap. Requirements:
+
+1. The index type supports index-only scans (B-tree always does).
+2. All columns referenced by the query are stored in the index (as key or `INCLUDE` columns).
+3. The table's visibility map shows that the heap pages are clean (handled by `VACUUM`).
+
+```sql
+CREATE INDEX idx_products_price_name ON products (price) INCLUDE (name);
+
+-- Can be satisfied as an index-only scan
+SELECT name FROM products WHERE price < 100;
+```
+
+## Ordering options
+
+B-tree index columns can specify sort direction and null ordering:
+
+```sql
+CREATE INDEX idx_events_desc ON events (created_at DESC NULLS LAST);
+
+-- Useful for mixed-direction ORDER BY on multi-column index
+CREATE INDEX idx_reports ON reports (year ASC, revenue DESC);
+```
+
+## Maintaining indexes
+
+```sql
+-- Rebuild an index (exclusive lock)
+REINDEX INDEX idx_products_price;
+
+-- Rebuild without locking
+REINDEX INDEX CONCURRENTLY idx_products_price;
+
+-- Drop an index
+DROP INDEX idx_products_price;
+DROP INDEX CONCURRENTLY idx_products_price;
+```
+
+Run `ANALYZE` after bulk data loads to update planner statistics so the planner makes correct decisions about index usage:
+
+```sql
+ANALYZE products;
+```

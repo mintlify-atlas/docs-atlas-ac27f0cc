@@ -1,0 +1,306 @@
+---
+title: 'Constraints'
+description: 'NOT NULL, UNIQUE, PRIMARY KEY, FOREIGN KEY, CHECK, and EXCLUSION constraints in PostgreSQL. Enforce data integrity at the database level.'
+---
+
+Constraints enforce rules on the data stored in a table. If an operation would violate a constraint, PostgreSQL raises an error. Constraints can be defined at the column level or as separate table-level definitions.
+
+## NOT NULL
+
+A `NOT NULL` constraint prevents a column from holding a null value.
+
+```sql
+CREATE TABLE products (
+    product_no integer NOT NULL,
+    name       text    NOT NULL,
+    price      numeric          -- nullable
+);
+```
+
+Naming a NOT NULL constraint:
+
+```sql
+CREATE TABLE products (
+    product_no integer CONSTRAINT products_no_not_null NOT NULL,
+    name       text    NOT NULL,
+    price      numeric
+);
+```
+
+<Tip>
+In most database designs the majority of columns should be marked `NOT NULL`. This improves query performance because the planner can skip null checks.
+</Tip>
+
+## CHECK
+
+A `CHECK` constraint evaluates a Boolean expression for each row. A row is accepted only if the expression is `true` or `NULL`.
+
+```sql
+CREATE TABLE products (
+    product_no integer,
+    name       text,
+    price      numeric CHECK (price > 0)
+);
+```
+
+Named check constraint:
+
+```sql
+CREATE TABLE products (
+    product_no       integer,
+    name             text,
+    price            numeric    CONSTRAINT positive_price CHECK (price > 0),
+    discounted_price numeric,
+    CONSTRAINT valid_discount   CHECK (price > discounted_price)
+);
+```
+
+Table-level check referencing multiple columns:
+
+```sql
+CREATE TABLE products (
+    product_no       integer,
+    name             text,
+    price            numeric CHECK (price > 0),
+    discounted_price numeric CHECK (discounted_price > 0),
+    CHECK (price > discounted_price)
+);
+```
+
+<Warning>
+PostgreSQL does not support `CHECK` constraints that reference rows other than the one being checked. For cross-row constraints, use a trigger or an exclusion constraint.
+</Warning>
+
+## UNIQUE
+
+A `UNIQUE` constraint ensures that the combination of values in the listed columns is unique across the table. Null values are not considered equal by default (multiple null rows are allowed).
+
+```sql
+CREATE TABLE products (
+    product_no integer UNIQUE,
+    name       text,
+    price      numeric
+);
+```
+
+Multi-column uniqueness:
+
+```sql
+CREATE TABLE order_items (
+    order_id    integer,
+    product_no  integer,
+    quantity    integer,
+    UNIQUE (order_id, product_no)
+);
+```
+
+To treat null values as equal (only one null allowed):
+
+```sql
+CREATE TABLE products (
+    product_no integer UNIQUE NULLS NOT DISTINCT,
+    name       text
+);
+```
+
+<Note>
+Adding a `UNIQUE` constraint automatically creates a unique B-tree index on the listed columns.
+</Note>
+
+## PRIMARY KEY
+
+A `PRIMARY KEY` constraint is a combination of `UNIQUE` and `NOT NULL`. A table can have at most one primary key.
+
+```sql
+CREATE TABLE products (
+    product_no integer PRIMARY KEY,
+    name       text    NOT NULL,
+    price      numeric
+);
+```
+
+Composite primary key:
+
+```sql
+CREATE TABLE order_items (
+    order_id   integer,
+    product_no integer,
+    quantity   integer,
+    PRIMARY KEY (order_id, product_no)
+);
+```
+
+## FOREIGN KEY
+
+A `FOREIGN KEY` constraint ensures that a column (or group of columns) matches values in the referenced table's primary key or unique constraint.
+
+```sql
+CREATE TABLE products (
+    product_no integer PRIMARY KEY,
+    name       text,
+    price      numeric
+);
+
+CREATE TABLE orders (
+    order_id    integer PRIMARY KEY,
+    product_no  integer REFERENCES products (product_no),
+    quantity    integer
+);
+```
+
+When the referenced column is the primary key, the column list can be omitted:
+
+```sql
+CREATE TABLE orders (
+    order_id   integer PRIMARY KEY,
+    product_no integer REFERENCES products,  -- references products(product_no) implicitly
+    quantity   integer
+);
+```
+
+### ON DELETE and ON UPDATE actions
+
+Control what happens when a referenced row is deleted or its key is updated.
+
+```sql
+CREATE TABLE order_items (
+    product_no integer REFERENCES products ON DELETE RESTRICT,
+    order_id   integer REFERENCES orders   ON DELETE CASCADE,
+    quantity   integer,
+    PRIMARY KEY (product_no, order_id)
+);
+```
+
+<CardGroup cols={2}>
+  <Card title="NO ACTION (default)">
+    The constraint check is deferred to the end of the statement. If the constraint is still violated, an error is raised.
+  </Card>
+  <Card title="RESTRICT">
+    Immediately prevents deletion or update of a referenced row. Cannot be deferred.
+  </Card>
+  <Card title="CASCADE">
+    Automatically deletes or updates the referencing rows when the referenced row is deleted or updated.
+  </Card>
+  <Card title="SET NULL / SET DEFAULT">
+    Sets the referencing column(s) to NULL or their default value when the referenced row is deleted or updated.
+  </Card>
+</CardGroup>
+
+Multi-column foreign key:
+
+```sql
+CREATE TABLE t1 (
+    a integer PRIMARY KEY,
+    b integer,
+    c integer,
+    FOREIGN KEY (b, c) REFERENCES other_table (c1, c2)
+);
+```
+
+Self-referential foreign key (for tree structures):
+
+```sql
+CREATE TABLE categories (
+    id        integer PRIMARY KEY,
+    parent_id integer REFERENCES categories,
+    name      text NOT NULL
+);
+```
+
+### Partial SET NULL
+
+When only some columns of a composite foreign key should be nulled:
+
+```sql
+CREATE TABLE posts (
+    tenant_id  integer REFERENCES tenants ON DELETE CASCADE,
+    post_id    integer NOT NULL,
+    author_id  integer,
+    PRIMARY KEY (tenant_id, post_id),
+    FOREIGN KEY (tenant_id, author_id) REFERENCES users ON DELETE SET NULL (author_id)
+);
+```
+
+## EXCLUSION constraints
+
+Exclusion constraints generalize uniqueness. They ensure that for any two rows, at least one of the specified operator comparisons returns false or null. They require a GiST or SP-GiST index.
+
+A common use case is preventing overlapping time ranges or geometric shapes:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE room_bookings (
+    room_no   integer,
+    during    tstzrange,
+    EXCLUDE USING gist (room_no WITH =, during WITH &&)
+);
+```
+
+This prevents any two bookings for the same room with overlapping time ranges.
+
+```sql
+-- This succeeds
+INSERT INTO room_bookings VALUES (101, '[2024-06-15 09:00+00, 2024-06-15 10:00+00)');
+
+-- This fails: room 101 is already booked for that time
+INSERT INTO room_bookings VALUES (101, '[2024-06-15 09:30+00, 2024-06-15 11:00+00)');
+-- ERROR: conflicting key value violates exclusion constraint
+```
+
+Geometric exclusion (no overlapping circles):
+
+```sql
+CREATE TABLE circles (
+    c circle,
+    EXCLUDE USING gist (c WITH &&)
+);
+```
+
+<Note>
+Adding an exclusion constraint automatically creates an index of the specified type.
+</Note>
+
+## Adding and dropping constraints with ALTER TABLE
+
+```sql
+-- Add a named constraint
+ALTER TABLE products
+    ADD CONSTRAINT positive_price CHECK (price > 0);
+
+-- Drop a constraint by name
+ALTER TABLE products
+    DROP CONSTRAINT positive_price;
+
+-- Add a foreign key
+ALTER TABLE orders
+    ADD FOREIGN KEY (product_no) REFERENCES products;
+
+-- Add a NOT NULL constraint
+ALTER TABLE products
+    ALTER COLUMN name SET NOT NULL;
+
+-- Remove NOT NULL
+ALTER TABLE products
+    ALTER COLUMN name DROP NOT NULL;
+```
+
+## Deferrable constraints
+
+FOREIGN KEY and UNIQUE constraints can be declared deferrable, which means their check is postponed to the end of the transaction.
+
+```sql
+CREATE TABLE accounts (
+    id      integer PRIMARY KEY,
+    parent  integer REFERENCES accounts DEFERRABLE INITIALLY DEFERRED
+);
+```
+
+Within a transaction, you can also change the timing explicitly:
+
+```sql
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+-- ... perform operations that would temporarily violate constraints
+COMMIT;
+```

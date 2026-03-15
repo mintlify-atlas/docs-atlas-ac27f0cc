@@ -1,0 +1,267 @@
+---
+title: PL/Perl — Perl procedural language
+description: Write PostgreSQL functions and procedures in Perl using PL/Perl (trusted) or PL/PerlU (untrusted). Covers function creation, arguments, SPI access, triggers, and error handling.
+---
+
+PL/Perl is a loadable procedural language that lets you write PostgreSQL functions and procedures in Perl. It is particularly useful for its rich string manipulation operators and regular expression support.
+
+<CardGroup cols={2}>
+  <Card title="PL/Perl (plperl)" icon="shield-check">
+    Trusted. Runs in a restricted Perl interpreter. Available to non-superusers.
+  </Card>
+  <Card title="PL/PerlU (plperlu)" icon="triangle-exclamation">
+    Untrusted. Full Perl interpreter. Can use any Perl module. Superuser-only.
+  </Card>
+</CardGroup>
+
+## Installation
+
+```sql
+CREATE EXTENSION plperl;   -- trusted variant
+CREATE EXTENSION plperlu;  -- untrusted variant
+```
+
+## Creating functions
+
+```sql
+CREATE FUNCTION funcname (argument-types)
+RETURNS return-type
+AS $$
+    # PL/Perl function body
+$$ LANGUAGE plperl;
+```
+
+Arguments are passed in `@_` (or as `$_[0]`, `$_[1]`, etc.). The return value is the last expression evaluated or the value of an explicit `return` statement.
+
+**Example — returning the larger of two integers:**
+
+```sql
+CREATE FUNCTION perl_max(integer, integer) RETURNS integer AS $$
+    if ($_[0] > $_[1]) { return $_[0]; }
+    return $_[1];
+$$ LANGUAGE plperl;
+
+SELECT perl_max(3, 7);  -- returns 7
+```
+
+### Handling NULL arguments
+
+SQL NULL values appear as Perl `undef`. The function above behaves incorrectly with nulls. Use `STRICT` or check explicitly:
+
+```sql
+CREATE FUNCTION perl_max(integer, integer) RETURNS integer AS $$
+    my ($x, $y) = @_;
+    if (not defined $x) {
+        return undef if not defined $y;
+        return $y;
+    }
+    return $x if not defined $y;
+    return $x if $x > $y;
+    return $y;
+$$ LANGUAGE plperl;
+```
+
+To return SQL NULL, `return undef`.
+
+<Note>
+Arguments are converted from the database encoding to UTF-8 for use inside PL/Perl, then converted back on return.
+</Note>
+
+## Composite type arguments and return values
+
+### Receiving composite types
+
+Composite-type arguments arrive as hash references:
+
+```sql
+CREATE TABLE employee (
+    name        text,
+    basesalary  integer,
+    bonus       integer
+);
+
+CREATE FUNCTION empcomp(employee) RETURNS integer AS $$
+    my ($emp) = @_;
+    return $emp->{basesalary} + $emp->{bonus};
+$$ LANGUAGE plperl;
+
+SELECT name, empcomp(employee.*) FROM employee;
+```
+
+### Returning composite types
+
+Return a hash reference with keys matching the output column names:
+
+```sql
+CREATE TYPE named_value AS (name text, value integer);
+
+CREATE FUNCTION make_pair(name text, value integer)
+    RETURNS named_value AS $$
+    return { name => $_[0], value => $_[1] };
+$$ LANGUAGE plperl;
+```
+
+### Returning sets
+
+Return an array reference of row references, or use `return_next`:
+
+```sql
+CREATE FUNCTION perl_set()
+    RETURNS SETOF integer AS $$
+    return_next($_) for (1..5);
+    return undef;
+$$ LANGUAGE plperl;
+
+-- Or return an array reference:
+CREATE FUNCTION perl_set2()
+    RETURNS SETOF integer AS $$
+    return [1, 2, 3, 4, 5];
+$$ LANGUAGE plperl;
+```
+
+### Returning arrays
+
+```sql
+CREATE OR REPLACE FUNCTION returns_array()
+RETURNS text[][] AS $$
+    return [['a"b','c,d'],['e\\f','g']];
+$$ LANGUAGE plperl;
+```
+
+PostgreSQL arrays are passed in as `PostgreSQL::InServer::ARRAY` objects, which can be used as array references or strings.
+
+## Database access (SPI)
+
+PL/Perl provides several SPI functions for database access:
+
+### spi_exec_query
+
+Executes a query and returns a hash reference containing the results:
+
+```perl
+my $res = spi_exec_query('SELECT id, name FROM users WHERE active = true', 100);
+# $res->{processed}   — number of rows returned
+# $res->{rows}        — arrayref of hash refs
+
+foreach my $row (@{$res->{rows}}) {
+    elog(NOTICE, "User: $row->{id} / $row->{name}");
+}
+```
+
+### spi_prepare and spi_exec_prepared
+
+For queries run multiple times:
+
+```perl
+my $plan = spi_prepare(
+    'SELECT * FROM accounts WHERE id = $1 AND type = $2',
+    'integer', 'text'
+);
+
+my $res = spi_exec_prepared($plan, 42, 'checking');
+my $res2 = spi_exec_prepared($plan, 99, 'savings');
+```
+
+Free a prepared plan when done:
+
+```perl
+spi_freeplan($plan);
+```
+
+### spi_query and spi_fetchrow
+
+For cursor-style access to large result sets:
+
+```perl
+my $cursor = spi_query('SELECT * FROM large_table ORDER BY id');
+while (defined(my $row = spi_fetchrow($cursor))) {
+    # process $row
+}
+```
+
+## Messaging and error handling
+
+Use `elog()` to send messages at different levels:
+
+```perl
+elog(DEBUG,   'debug message');
+elog(LOG,     'log message');
+elog(INFO,    'informational');
+elog(NOTICE,  "Processing row: $id");
+elog(WARNING, 'something looks off');
+elog(ERROR,   'something went wrong');  # raises an exception
+```
+
+Level constants (`DEBUG`, `LOG`, `INFO`, `NOTICE`, `WARNING`, `ERROR`) are imported automatically.
+
+`elog(ERROR, ...)` raises a PostgreSQL error and does not return.
+
+## Triggers
+
+Trigger functions receive metadata in the `$_TD` hash reference:
+
+| Key | Description |
+|-----|-------------|
+| `$_TD->{event}` | `"INSERT"`, `"UPDATE"`, `"DELETE"`, `"TRUNCATE"` |
+| `$_TD->{when}` | `"BEFORE"`, `"AFTER"`, `"INSTEAD OF"` |
+| `$_TD->{level}` | `"ROW"` or `"STATEMENT"` |
+| `$_TD->{new}` | Hash ref of new row values |
+| `$_TD->{old}` | Hash ref of old row values |
+| `$_TD->{name}` | Trigger name |
+| `$_TD->{table_name}` | Table name |
+| `$_TD->{table_schema}` | Schema name |
+| `$_TD->{argc}` | Number of trigger arguments |
+| `$_TD->{args}` | Arrayref of trigger arguments |
+
+```sql
+CREATE FUNCTION deny_salary_cut() RETURNS trigger AS $$
+    if ($_TD->{event} eq 'UPDATE') {
+        if ($_TD->{new}{salary} < $_TD->{old}{salary}) {
+            elog(ERROR, 'Salary cuts are not allowed');
+        }
+    }
+    return undef;  # proceed with operation unchanged
+$$ LANGUAGE plperl;
+
+CREATE TRIGGER no_salary_cuts
+    BEFORE UPDATE ON employees
+    FOR EACH ROW EXECUTE FUNCTION deny_salary_cut();
+```
+
+Return values for row triggers:
+- `undef` — proceed unchanged
+- `"SKIP"` — suppress the operation (BEFORE row triggers only)
+- `"MODIFY"` — use the (modified) `$_TD->{new}` values
+
+## Boolean transforms
+
+By default, `bool` values arrive in Perl as the strings `'t'` or `'f'`. This is a problem because `'f'` is truthy in Perl. Use the `bool_plperl` extension:
+
+```sql
+CREATE EXTENSION bool_plperl;
+
+CREATE FUNCTION perl_and(bool, bool) RETURNS bool
+TRANSFORM FOR TYPE bool
+AS $$
+    my ($a, $b) = @_;
+    return $a && $b;
+$$ LANGUAGE plperl;
+```
+
+With the transform, `bool` arguments arrive as `1` or `''` (Perl's true/false).
+
+## Trusted vs. untrusted Perl
+
+| Feature | `plperl` | `plperlu` |
+|---------|----------|-----------|
+| Who can create functions | Any user granted `USAGE` on the language | Superuser only |
+| File I/O | Not allowed | Allowed |
+| Network access | Not allowed | Allowed |
+| Arbitrary Perl modules | Restricted to safe modules | Unrestricted |
+| `require` / `use` | Blocked by default | Allowed |
+
+To allow non-superusers to create trusted PL/Perl functions:
+
+```sql
+GRANT USAGE ON LANGUAGE plperl TO some_role;
+```

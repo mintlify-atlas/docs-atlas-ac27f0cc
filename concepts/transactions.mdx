@@ -1,0 +1,275 @@
+---
+title: "Transactions"
+description: "Transaction control with BEGIN, COMMIT, ROLLBACK, and SAVEPOINT. Isolation levels, read phenomena, serialization, and explicit locking."
+---
+
+Transactions are a fundamental concept of all database systems. The essential point is that a transaction bundles multiple steps into a single, **all-or-nothing** operation: intermediate states are not visible to other concurrent transactions, and if a failure prevents the transaction from completing, none of its steps affect the database at all.
+
+## Transaction fundamentals
+
+PostgreSQL treats every SQL statement as executing within a transaction. If you do not issue a `BEGIN` command, each individual statement has an implicit `BEGIN` and (if successful) `COMMIT` wrapped around it. A group of statements surrounded by `BEGIN` and `COMMIT` is called a **transaction block**.
+
+```sql
+-- Implicit single-statement transaction
+INSERT INTO accounts (name, balance) VALUES ('Alice', 1000.00);
+
+-- Explicit multi-statement transaction block
+BEGIN;
+
+UPDATE accounts SET balance = balance - 100.00
+    WHERE name = 'Alice';
+UPDATE accounts SET balance = balance + 100.00
+    WHERE name = 'Bob';
+
+COMMIT;
+```
+
+PostgreSQL transaction control commands:
+
+| Command | Effect |
+|---|---|
+| `BEGIN` | Start a transaction block |
+| `COMMIT` or `END` | Make all changes in the transaction permanent |
+| `ROLLBACK` or `ABORT` | Undo all changes in the transaction |
+| `SAVEPOINT name` | Define a partial rollback point within the transaction |
+| `ROLLBACK TO name` | Roll back to a savepoint, discarding changes made after it |
+| `RELEASE name` | Destroy a savepoint, freeing its resources |
+
+<Note>
+  PostgreSQL's transaction system is a three-layer system. The bottom layer implements low-level transactions and subtransactions, on top of which rests the main loop's control code, which in turn implements user-visible transactions and savepoints.
+  See `src/backend/access/transam/README` for the internal design.
+</Note>
+
+## ACID properties
+
+PostgreSQL guarantees the four ACID properties:
+
+<AccordionGroup>
+  <Accordion title="Atomicity">
+    A transaction either happens completely or not at all. From the point of view of other transactions, it either completes entirely or had no effect. There is no way to observe the half-done state of a transaction.
+  </Accordion>
+  <Accordion title="Consistency">
+    A transaction brings the database from one valid state to another. All constraints (NOT NULL, CHECK, UNIQUE, FOREIGN KEY) are checked at commit time (or on each statement for deferred=false constraints).
+  </Accordion>
+  <Accordion title="Isolation">
+    The intermediate state of a transaction is invisible to other transactions. PostgreSQL implements isolation using MVCC (see [MVCC](/concepts/mvcc)), which means readers do not block writers and writers do not block readers.
+  </Accordion>
+  <Accordion title="Durability">
+    Once a transaction is committed and acknowledged by the database, its changes are permanently recorded in the Write-Ahead Log (WAL) and will survive crashes. WAL records are flushed to durable storage before the commit acknowledgment is returned to the client.
+  </Accordion>
+</AccordionGroup>
+
+## Savepoints
+
+Savepoints allow you to selectively discard parts of a transaction while committing the rest. After defining a savepoint, you can roll back to it if needed without aborting the entire transaction.
+
+```sql
+BEGIN;
+
+UPDATE accounts SET balance = balance - 100.00
+    WHERE name = 'Alice';
+
+SAVEPOINT my_savepoint;
+
+UPDATE accounts SET balance = balance + 100.00
+    WHERE name = 'Bob';
+
+-- Oops, should have credited Wally instead
+ROLLBACK TO my_savepoint;
+
+UPDATE accounts SET balance = balance + 100.00
+    WHERE name = 'Wally';
+
+COMMIT;
+```
+
+After rolling back to a savepoint, it continues to be defined, so you can roll back to it multiple times. `ROLLBACK TO` is also the only way to regain control of a transaction block that was put into aborted state by a system error, other than rolling it back completely.
+
+<Info>
+  Rolling back to a savepoint also automatically releases all savepoints defined after it. Locks acquired after a savepoint are released immediately on rollback to that savepoint, consistent with the principle that `ROLLBACK` cancels all effects of commands since the savepoint.
+</Info>
+
+## Isolation levels
+
+The SQL standard defines four transaction isolation levels in terms of **read phenomena** that concurrent transactions may or may not produce:
+
+| Phenomenon | Description |
+|---|---|
+| **Dirty read** | A transaction reads data written by a concurrent uncommitted transaction |
+| **Nonrepeatable read** | A transaction re-reads data it previously read and finds it was modified by a committed concurrent transaction |
+| **Phantom read** | A transaction re-executes a query and finds a different set of rows due to another committed transaction |
+| **Serialization anomaly** | The result of a group of committed transactions is inconsistent with any serial execution of those transactions |
+
+PostgreSQL implements three distinct isolation levels (the four SQL standard levels map to three internal implementations):
+
+| SQL standard level | PG implementation | Dirty read | Nonrepeatable read | Phantom read | Serialization anomaly |
+|---|---|---|---|---|---|
+| Read uncommitted | Same as Read committed | Not possible | Possible | Possible | Possible |
+| **Read committed** (default) | Snapshot per statement | Not possible | Possible | Possible | Possible |
+| Repeatable read | Snapshot per transaction | Not possible | Not possible | Not possible\* | Possible |
+| Serializable | SSI | Not possible | Not possible | Not possible | Not possible |
+
+\* PostgreSQL's Repeatable Read level prevents phantom reads, which is stronger than the SQL standard requires. This is acceptable because the standard specifies minimum protections, not maximum.
+
+Set the isolation level for a transaction:
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+-- or
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+```
+
+### Read committed (default)
+
+Read Committed is the default isolation level in PostgreSQL. A `SELECT` query sees only data committed before the query began — it never sees uncommitted data or changes committed by concurrent transactions during the query's execution.
+
+```sql
+BEGIN;  -- isolation level: READ COMMITTED
+
+-- This SELECT sees a snapshot as of the moment it starts
+SELECT balance FROM accounts WHERE name = 'Alice';
+
+-- A concurrent transaction commits here, changing Alice's balance
+
+-- This second SELECT may see different data than the first,
+-- because it takes a new snapshot
+SELECT balance FROM accounts WHERE name = 'Alice';
+
+COMMIT;
+```
+
+Read Committed is adequate for many applications and is fast and simple. However, it is not sufficient when complex queries need a consistent view of the database throughout the transaction.
+
+### Repeatable read
+
+Repeatable Read sees data committed before the **transaction** began, not just before each statement. Successive `SELECT` commands within a single transaction see the same data.
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+-- Both SELECTs see the same snapshot
+SELECT balance FROM accounts WHERE name = 'Alice';
+-- (concurrent transaction commits here)
+SELECT balance FROM accounts WHERE name = 'Alice';  -- same result
+
+COMMIT;
+```
+
+If an `UPDATE`, `DELETE`, or `SELECT FOR UPDATE` in a Repeatable Read transaction encounters a row that was modified by a concurrent transaction after the snapshot was taken, the transaction is rolled back with:
+
+```
+ERROR:  could not serialize access due to concurrent update
+```
+
+Applications using Repeatable Read must be prepared to retry transactions when this error occurs.
+
+### Serializable
+
+Serializable is the strictest isolation level. It emulates serial transaction execution: the result of any set of concurrently executing Serializable transactions is guaranteed to be the same as if they ran one at a time in some order.
+
+PostgreSQL implements Serializable using **Serializable Snapshot Isolation (SSI)**, which adds monitoring for read/write dependency conflicts on top of the Repeatable Read snapshot mechanism. This monitoring does not introduce blocking beyond what Repeatable Read requires.
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- Transaction A computes sum of class=1 rows
+SELECT SUM(value) FROM mytab WHERE class = 1;  -- returns 30
+-- and inserts that as a new class=2 row
+INSERT INTO mytab VALUES (2, 30);
+
+COMMIT;
+-- If a concurrent transaction B was computing SUM(class=2) and inserting
+-- into class=1, one of the two transactions will be rolled back:
+-- ERROR:  could not serialize access due to read/write dependencies among transactions
+```
+
+When a serialization failure occurs (SQLSTATE `40001`), the application must roll back and retry the entire transaction.
+
+<Tip>
+  For optimal performance with Serializable transactions:
+  - Declare transactions as `READ ONLY` when possible
+  - Use a connection pool to limit the number of active connections
+  - Avoid leaving connections idle in a transaction (`idle_in_transaction_session_timeout` can help enforce this)
+  - Prefer index scans over sequential scans to reduce the scope of predicate locks
+</Tip>
+
+## Explicit locking
+
+Although MVCC handles most concurrency scenarios without explicit locks, PostgreSQL provides table-level and row-level locks for cases where application logic requires explicit coordination.
+
+### Table-level locks
+
+All table-level lock modes, their typical acquisition context, and their conflicts:
+
+| Lock mode | Acquired by | Conflicts with |
+|---|---|---|
+| `ACCESS SHARE` | `SELECT` | `ACCESS EXCLUSIVE` only |
+| `ROW SHARE` | `SELECT FOR UPDATE/SHARE` | `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `ROW EXCLUSIVE` | `INSERT`, `UPDATE`, `DELETE`, `MERGE` | `SHARE`, `SHARE ROW EXCLUSIVE`, `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `SHARE UPDATE EXCLUSIVE` | `VACUUM`, `ANALYZE`, `CREATE INDEX CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE`, `SHARE`, `SHARE ROW EXCLUSIVE`, `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `SHARE` | `CREATE INDEX` (non-concurrent) | `ROW EXCLUSIVE`, `SHARE UPDATE EXCLUSIVE`, `SHARE ROW EXCLUSIVE`, `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `SHARE ROW EXCLUSIVE` | `CREATE TRIGGER`, some `ALTER TABLE` forms | All except `ACCESS SHARE` and `ROW SHARE` |
+| `EXCLUSIVE` | `REFRESH MATERIALIZED VIEW CONCURRENTLY` | All except `ACCESS SHARE` |
+| `ACCESS EXCLUSIVE` | `DROP TABLE`, `TRUNCATE`, `VACUUM FULL`, `ALTER TABLE` | All lock modes |
+
+<Tip>
+  Only an `ACCESS EXCLUSIVE` lock blocks a plain `SELECT` (without `FOR UPDATE/SHARE`). This means that most DDL operations (which acquire `ACCESS EXCLUSIVE`) will briefly block reads.
+</Tip>
+
+Explicitly acquire a lock:
+
+```sql
+-- Lock a table in SHARE mode to prevent concurrent writes
+LOCK TABLE accounts IN SHARE MODE;
+```
+
+Locks acquired within a transaction are held until the transaction ends. A lock acquired after a savepoint is released if that savepoint is rolled back to.
+
+### Row-level locks
+
+Row-level locks are acquired using `SELECT ... FOR ...` clauses. They do not affect data querying — they block only writers and lockers to the same row.
+
+```sql
+-- Lock rows for update; blocks concurrent UPDATE/DELETE/SELECT FOR UPDATE
+SELECT * FROM accounts
+WHERE name = 'Alice'
+FOR UPDATE;
+
+-- Lock rows in share mode; allows other readers to share-lock,
+-- blocks writers
+SELECT * FROM accounts
+WHERE name = 'Alice'
+FOR SHARE;
+
+-- Weaker exclusive lock; does not block SELECT FOR KEY SHARE
+SELECT * FROM accounts
+WHERE name = 'Alice'
+FOR NO KEY UPDATE;
+```
+
+### Advisory locks
+
+Advisory locks are application-level locks that are not tied to a specific database object. They are useful for coordinating concurrent processes outside the scope of normal table locking.
+
+```sql
+-- Session-level advisory lock (released on disconnect)
+SELECT pg_advisory_lock(12345);
+-- ... do work ...
+SELECT pg_advisory_unlock(12345);
+
+-- Transaction-level advisory lock (released at transaction end)
+SELECT pg_advisory_xact_lock(12345);
+```
+
+### Deadlock detection
+
+When two transactions each hold a lock that the other is waiting for, a **deadlock** occurs. PostgreSQL detects deadlocks automatically and resolves them by aborting one of the transactions:
+
+```
+ERROR:  deadlock detected
+DETAIL:  Process 12345 waits for ShareLock on transaction 67890;
+         blocked by process 11111.
+```
+
+The application must handle this error by rolling back and retrying the transaction. Designing transactions to acquire locks in a consistent order across all code paths prevents deadlocks from occurring.

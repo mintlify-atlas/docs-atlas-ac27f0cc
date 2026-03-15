@@ -1,0 +1,280 @@
+---
+title: PostGIS
+description: Introduction to PostGIS, the spatial extension for PostgreSQL that adds geometry, geography, and spatial index support.
+---
+
+PostGIS is a spatial extension for PostgreSQL that adds support for geographic objects. It enables storing, indexing, and querying geographic and geometric data directly in the database.
+
+<Info>
+PostGIS is a separate project from PostgreSQL and is not included in the PostgreSQL source. You must install it separately. The official project site is [https://postgis.net](https://postgis.net).
+</Info>
+
+## Installation
+
+<Tabs>
+  <Tab title="Debian/Ubuntu">
+```bash
+# Install from PGDG repositories
+apt-get install postgresql-17-postgis-3
+
+# Then enable it in the database
+psql -U postgres -d mydb -c "CREATE EXTENSION postgis;"
+```
+  </Tab>
+  <Tab title="RHEL/CentOS">
+```bash
+yum install postgis33_17
+
+psql -U postgres -d mydb -c "CREATE EXTENSION postgis;"
+```
+  </Tab>
+  <Tab title="macOS (Homebrew)">
+```bash
+brew install postgis
+
+psql -U postgres -d mydb -c "CREATE EXTENSION postgis;"
+```
+  </Tab>
+  <Tab title="Docker">
+```bash
+docker pull postgis/postgis:17-3.5
+docker run -e POSTGRES_PASSWORD=secret -p 5432:5432 postgis/postgis:17-3.5
+```
+  </Tab>
+</Tabs>
+
+Verify the installation:
+
+```sql
+SELECT PostGIS_version();
+-- 3.5 USE_GEOS=1 USE_PROJ=1 USE_STATS=1
+```
+
+## Spatial data types
+
+PostGIS adds two primary geometric data types:
+
+<CardGroup cols={2}>
+  <Card title="geometry" icon="vector-square">
+    Stores planar (Euclidean) coordinates. Calculations treat the earth as flat. Appropriate for local or projected coordinate systems (e.g., UTM).
+  </Card>
+  <Card title="geography" icon="globe">
+    Stores spheroidal coordinates (longitude/latitude). Calculations account for the curvature of the earth. Appropriate for global-scale data but slower than geometry.
+  </Card>
+</CardGroup>
+
+## Coordinate systems and SRID
+
+Every spatial value has a Spatial Reference ID (SRID) that defines its coordinate system:
+
+| SRID | Description |
+|------|-------------|
+| 4326 | WGS 84 — standard longitude/latitude (GPS coordinates) |
+| 3857 | Web Mercator — used by web mapping services (Google Maps, OpenStreetMap) |
+| 0 | Undefined / Cartesian coordinate system |
+
+```sql
+-- Check what SRID is being used
+SELECT ST_SRID(ST_GeomFromText('POINT(0 0)', 4326));
+-- 4326
+```
+
+## Core spatial functions
+
+### Constructors
+
+| Function | Description |
+|----------|-------------|
+| `ST_GeomFromText(wkt, srid)` | Create geometry from WKT (Well-Known Text) |
+| `ST_GeomFromEWKT(ewkt)` | Create geometry from EWKT (Extended WKT with SRID) |
+| `ST_MakePoint(x, y)` | Create a 2D point |
+| `ST_MakePoint(x, y, z)` | Create a 3D point |
+| `ST_GeographyFromText(wkt)` | Create geography from WKT |
+
+```sql
+-- WKT examples
+SELECT ST_GeomFromText('POINT(-73.9857 40.7484)', 4326);  -- NYC Empire State Building
+SELECT ST_GeomFromText('LINESTRING(0 0, 1 1, 2 0)', 4326);
+SELECT ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326);
+```
+
+### Output
+
+| Function | Description |
+|----------|-------------|
+| `ST_AsText(geometry)` | Return WKT representation |
+| `ST_AsEWKT(geometry)` | Return EWKT (with SRID) |
+| `ST_AsGeoJSON(geometry)` | Return GeoJSON representation |
+| `ST_AsBinary(geometry)` | Return WKB (Well-Known Binary) |
+
+```sql
+SELECT ST_AsText(ST_MakePoint(-73.9857, 40.7484));
+-- POINT(-73.9857 40.7484)
+
+SELECT ST_AsGeoJSON(ST_GeomFromText('POINT(-73.9857 40.7484)', 4326));
+-- {"type":"Point","coordinates":[-73.9857,40.7484]}
+```
+
+### Measurement
+
+| Function | Description |
+|----------|-------------|
+| `ST_Distance(geom_a, geom_b)` | Distance between two geometries (in the units of the CRS, or meters for geography) |
+| `ST_Length(geometry)` | Length of a line |
+| `ST_Area(geometry)` | Area of a polygon |
+| `ST_Perimeter(geometry)` | Perimeter of a polygon |
+
+```sql
+-- Distance between two lon/lat points (returns degrees for geometry SRID 4326)
+SELECT ST_Distance(
+  ST_GeomFromText('POINT(-73.9857 40.7484)', 4326),
+  ST_GeomFromText('POINT(-74.0059 40.7128)', 4326)
+);
+
+-- For accurate distances in meters, use geography type
+SELECT ST_Distance(
+  'SRID=4326;POINT(-73.9857 40.7484)'::geography,
+  'SRID=4326;POINT(-74.0059 40.7128)'::geography
+);
+-- ~4282 meters
+```
+
+### Spatial relationships (predicates)
+
+| Function | Description |
+|----------|-------------|
+| `ST_Contains(geom_a, geom_b)` | Does geom_a contain geom_b? |
+| `ST_Within(geom_a, geom_b)` | Is geom_a within geom_b? |
+| `ST_Intersects(geom_a, geom_b)` | Do the two geometries intersect? |
+| `ST_Touches(geom_a, geom_b)` | Do the two geometries share a boundary point? |
+| `ST_Overlaps(geom_a, geom_b)` | Do the two geometries overlap (but neither contains the other)? |
+| `ST_Equals(geom_a, geom_b)` | Are the two geometries spatially equal? |
+| `ST_Crosses(geom_a, geom_b)` | Do the geometries cross? |
+| `ST_DWithin(geom_a, geom_b, dist)` | Are the two geometries within dist of each other? |
+
+### Construction and transformation
+
+| Function | Description |
+|----------|-------------|
+| `ST_Buffer(geometry, radius)` | Return a geometry expanded by radius |
+| `ST_Centroid(geometry)` | Return the geometric centroid |
+| `ST_Union(geometry, geometry)` | Union of two geometries |
+| `ST_Intersection(geom_a, geom_b)` | Intersection of two geometries |
+| `ST_Difference(geom_a, geom_b)` | Part of geom_a not in geom_b |
+| `ST_Transform(geometry, srid)` | Transform to a different coordinate system |
+| `ST_SetSRID(geometry, srid)` | Set the SRID of a geometry |
+
+## Spatial indexes
+
+Always create a GiST index on geometry or geography columns for spatial queries:
+
+```sql
+CREATE INDEX locations_geom_idx ON locations USING GIST (geom);
+```
+
+The index enables spatial operators like `&&` (bounding box overlap) to be evaluated efficiently, and PostGIS spatial predicates automatically use the index when available.
+
+## Practical example: points of interest
+
+<Steps>
+  <Step title="Create a table with a geometry column">
+```sql
+CREATE TABLE points_of_interest (
+  id       serial PRIMARY KEY,
+  name     text NOT NULL,
+  category text,
+  geom     geometry(Point, 4326)  -- lon/lat in WGS 84
+);
+
+-- Create the spatial index
+CREATE INDEX poi_geom_idx ON points_of_interest USING GIST (geom);
+```
+  </Step>
+  <Step title="Insert data">
+```sql
+INSERT INTO points_of_interest (name, category, geom) VALUES
+  ('Empire State Building', 'landmark',
+   ST_GeomFromText('POINT(-73.9857 40.7484)', 4326)),
+  ('Central Park',          'park',
+   ST_GeomFromText('POINT(-73.9654 40.7829)', 4326)),
+  ('Brooklyn Bridge',       'landmark',
+   ST_GeomFromText('POINT(-73.9969 40.7061)', 4326)),
+  ('JFK Airport',           'airport',
+   ST_GeomFromText('POINT(-73.7781 40.6413)', 4326));
+```
+  </Step>
+  <Step title="Query nearby points">
+```sql
+-- Find all POIs within 5 km of Times Square
+SELECT name, category,
+  ST_Distance(
+    geom::geography,
+    ST_GeomFromText('POINT(-73.9855 40.7580)', 4326)::geography
+  ) AS distance_m
+FROM points_of_interest
+WHERE ST_DWithin(
+  geom::geography,
+  ST_GeomFromText('POINT(-73.9855 40.7580)', 4326)::geography,
+  5000   -- 5000 meters
+)
+ORDER BY distance_m;
+```
+  </Step>
+  <Step title="Query with a polygon boundary">
+```sql
+-- Create a neighborhood polygon
+WITH midtown AS (
+  SELECT ST_GeomFromText(
+    'POLYGON((
+      -74.0020 40.7400,
+      -73.9700 40.7400,
+      -73.9700 40.7700,
+      -74.0020 40.7700,
+      -74.0020 40.7400
+    ))',
+    4326
+  ) AS boundary
+)
+SELECT p.name, p.category
+FROM points_of_interest p, midtown m
+WHERE ST_Contains(m.boundary, p.geom);
+```
+  </Step>
+</Steps>
+
+## Working with polygons and areas
+
+```sql
+CREATE TABLE neighborhoods (
+  id     serial PRIMARY KEY,
+  name   text,
+  geom   geometry(Polygon, 4326)
+);
+
+-- Area in square meters (using geography for accuracy)
+SELECT name,
+  ST_Area(geom::geography) AS area_sqm,
+  ST_Area(geom::geography) / 1000000 AS area_sqkm
+FROM neighborhoods;
+
+-- Find which neighborhood each POI belongs to
+SELECT p.name AS poi, n.name AS neighborhood
+FROM points_of_interest p
+JOIN neighborhoods n ON ST_Within(p.geom, n.geom);
+```
+
+## Coordinate transformation
+
+```sql
+-- Convert a geometry from WGS84 (4326) to Web Mercator (3857)
+SELECT ST_AsText(
+  ST_Transform(
+    ST_GeomFromText('POINT(-73.9857 40.7484)', 4326),
+    3857
+  )
+);
+```
+
+<Warning>
+Always ensure that geometries being compared or measured share the same SRID, or explicitly cast to `geography` for geodetic calculations. Mixing SRIDs will produce incorrect results or errors.
+</Warning>

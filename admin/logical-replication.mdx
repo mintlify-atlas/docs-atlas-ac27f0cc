@@ -1,0 +1,222 @@
+---
+title: Logical replication
+description: Configure PostgreSQL logical replication using publications and subscriptions, manage logical replication slots, filter rows and columns, monitor with pg_stat_replication, and understand DDL limitations.
+---
+
+Logical replication replicates data changes — inserts, updates, deletes, and truncates — based on their logical content (row changes) rather than physical WAL block-level changes. It uses a publish/subscribe model and supports replication at the table level, including cross-version and cross-platform scenarios.
+
+Typical use cases:
+- Sending incremental changes to subscribers as they occur
+- Selectively replicating a subset of tables
+- Replicating between different major PostgreSQL versions
+- Consolidating multiple databases into one for analytics
+
+## Prerequisites
+
+On the **publisher**:
+
+```ini postgresql.conf
+wal_level = logical       # must be 'logical', not just 'replica'
+max_replication_slots = 5 # one per subscription, plus spares
+max_wal_senders = 5
+```
+
+Restart the server after changing `wal_level`.
+
+```conf pg_hba.conf
+host  all  all  subscriber_host/32  scram-sha-256
+```
+
+The subscription connects as a normal database user (not the `replication` pseudo-database), so the `pg_hba.conf` entry uses the actual database name.
+
+## Publications
+
+A **publication** is a set of changes from one or more tables (or all tables) in a single database.
+
+```sql
+-- Publish all tables in the database
+CREATE PUBLICATION all_tables_pub FOR ALL TABLES;
+
+-- Publish specific tables
+CREATE PUBLICATION orders_pub FOR TABLE orders, order_items;
+
+-- Publish all tables in a schema
+CREATE PUBLICATION app_pub FOR TABLES IN SCHEMA app;
+
+-- Publish only INSERT and UPDATE (no DELETE, no TRUNCATE)
+CREATE PUBLICATION insert_update_pub FOR TABLE orders
+  WITH (publish = 'insert, update');
+```
+
+Modify a publication:
+
+```sql
+-- Add a table
+ALTER PUBLICATION orders_pub ADD TABLE customers;
+
+-- Remove a table
+ALTER PUBLICATION orders_pub DROP TABLE order_items;
+
+-- Change published operations
+ALTER PUBLICATION orders_pub SET (publish = 'insert, update, delete');
+```
+
+View existing publications:
+
+```sql
+SELECT pubname, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate
+FROM pg_publication;
+```
+
+### Replica identity
+
+For a table to replicate `UPDATE` and `DELETE`, it must have a **replica identity** configured so the subscriber can identify which row to update or delete.
+
+```sql
+-- Default: uses primary key (best option)
+-- If the table has a primary key, this is already set.
+
+-- Use a specific unique index as replica identity
+ALTER TABLE orders REPLICA IDENTITY USING INDEX orders_order_num_key;
+
+-- Use the full row (fallback if no suitable key exists; slow for updates/deletes)
+ALTER TABLE orders REPLICA IDENTITY FULL;
+```
+
+<Warning>
+  `REPLICA IDENTITY FULL` sends the entire old row to identify the row to update or delete. This is significantly slower for large rows and high-churn tables. Use a primary key or unique index wherever possible.
+</Warning>
+
+### Row filters
+
+Publications can filter which rows are replicated using a `WHERE` clause:
+
+```sql
+-- Replicate only active orders
+CREATE PUBLICATION active_orders_pub FOR TABLE orders
+  WHERE (status = 'active');
+
+-- Add a row filter when altering a publication
+ALTER PUBLICATION orders_pub
+  ADD TABLE orders WHERE (region = 'EU');
+```
+
+### Column lists
+
+Publications can replicate only specific columns:
+
+```sql
+-- Replicate only selected columns (no PII)
+CREATE PUBLICATION public_orders_pub FOR TABLE orders
+  (order_id, created_at, total_amount, status);
+```
+
+## Subscriptions
+
+A **subscription** defines the connection to a publisher and the set of publications to subscribe to.
+
+```sql
+-- Create a subscription on the subscriber database
+CREATE SUBSCRIPTION orders_sub
+  CONNECTION 'host=publisher_host port=5432 user=alice dbname=sourcedb password=pass'
+  PUBLICATION orders_pub;
+```
+
+Creating a subscription:
+1. Connects to the publisher and creates a logical replication slot.
+2. Copies a snapshot of the published tables to the subscriber (initial sync).
+3. Begins streaming ongoing changes.
+
+### Subscription management
+
+```sql
+-- Disable a subscription (stop receiving changes)
+ALTER SUBSCRIPTION orders_sub DISABLE;
+
+-- Re-enable
+ALTER SUBSCRIPTION orders_sub ENABLE;
+
+-- Refresh to detect tables added to the publication
+ALTER SUBSCRIPTION orders_sub REFRESH PUBLICATION;
+
+-- Drop the subscription (also drops the replication slot on the publisher)
+DROP SUBSCRIPTION orders_sub;
+```
+
+View existing subscriptions:
+
+```sql
+SELECT subname, subenabled, subpublications, subconninfo
+FROM pg_subscription;
+```
+
+## Logical replication slots
+
+Each active subscription uses a logical replication slot on the publisher to track which WAL has been consumed.
+
+```sql
+-- View replication slots on the publisher
+SELECT slot_name, plugin, slot_type, database, active, restart_lsn, confirmed_flush_lsn
+FROM pg_replication_slots;
+
+-- Drop an orphaned slot (use with caution)
+SELECT pg_drop_replication_slot('orders_sub');
+```
+
+<Warning>
+  Logical replication slots retain WAL on the publisher until the subscriber confirms it has been applied. An inactive or disconnected subscriber with an active slot causes WAL to accumulate. Monitor `pg_replication_slots.confirmed_flush_lsn` and drop slots that are no longer needed.
+</Warning>
+
+## Monitoring logical replication
+
+### Publisher side
+
+```sql
+-- walsender processes for logical replication
+SELECT pid, application_name, state, sent_lsn, write_lsn, flush_lsn, replay_lsn
+FROM pg_stat_replication
+WHERE application_name IS NOT NULL;
+
+-- Slot lag (bytes of WAL not yet consumed)
+SELECT slot_name,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
+FROM pg_replication_slots
+WHERE slot_type = 'logical';
+```
+
+### Subscriber side
+
+```sql
+-- Subscription worker status
+SELECT subname, received_lsn, last_msg_send_time, last_msg_receipt_time
+FROM pg_stat_subscription;
+
+-- Per-table sync status
+SELECT subid, relname, srsubstate, srsublsn
+FROM pg_subscription_rel
+JOIN pg_class ON pg_class.oid = srrelid;
+```
+
+`srsubstate` values: `i` (initializing), `d` (data copy), `s` (synchronized), `r` (ready).
+
+## DDL limitations
+
+Logical replication does **not** replicate DDL statements. Schema changes must be applied to the subscriber manually before the corresponding DML is replicated.
+
+Not replicated:
+- `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`
+- `CREATE INDEX`
+- `TRUNCATE` (replicated only if `publish = 'truncate'` is set, and the subscriber must have the table)
+- Sequence values (sequences can be synchronized separately using `FOR ALL SEQUENCES`)
+
+<Note>
+  Apply schema changes to the subscriber **before** the corresponding rows arrive from the publisher. The logical replication worker will error and halt if it receives a row for a column that does not exist on the subscriber.
+</Note>
+
+## Upgrading PostgreSQL with logical replication
+
+Because logical replication works across major versions (publisher and subscriber can run different versions), you can use it as a zero-downtime upgrade strategy:
+
+1. Set up the new version instance as a subscriber.
+2. Wait for replication to catch up.
+3. In a short maintenance window, stop writes, confirm full sync, and promote the new instance.

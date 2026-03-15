@@ -1,0 +1,243 @@
+---
+title: Streaming replication
+description: Set up PostgreSQL streaming replication with a primary server, create a standby using pg_basebackup, configure primary_conninfo and replication slots, enable hot standby, and monitor replication lag with pg_stat_replication.
+---
+
+Streaming replication allows a standby server to stay current with the primary by receiving WAL records over a TCP connection as they are generated, without waiting for a full WAL segment file to be completed.
+
+## Architecture
+
+In a streaming replication setup:
+- The **primary** (read/write) runs `walsender` processes that stream WAL to standbys.
+- Each **standby** runs a `walreceiver` process that receives and applies WAL.
+- The standby can serve read-only queries when `hot_standby = on`.
+
+## Configuring the primary
+
+<Steps>
+  <Step title="Set WAL and replication parameters">
+    ```ini postgresql.conf
+    wal_level = replica          # minimum required for streaming replication
+    max_wal_senders = 5          # max concurrent walsender processes
+    max_replication_slots = 5    # needed if using replication slots
+    wal_keep_size = 1GB          # retain this much WAL for standbys (without slots)
+    hot_standby = on             # allow read-only queries on standbys
+    ```
+
+    These changes require a server restart.
+  </Step>
+
+  <Step title="Create a replication role">
+    ```sql
+    CREATE ROLE replicator REPLICATION LOGIN PASSWORD 'replpass';
+    ```
+  </Step>
+
+  <Step title="Add a pg_hba.conf entry for replication">
+    ```conf pg_hba.conf
+    # TYPE  DATABASE        USER         ADDRESS              METHOD
+    host    replication     replicator   192.168.1.100/32     scram-sha-256
+    ```
+
+    The `DATABASE` field must be `replication` (a special pseudo-database name). Reload after editing:
+
+    ```bash
+    pg_ctl reload -D /var/lib/pgsql/data
+    ```
+  </Step>
+</Steps>
+
+## Creating the standby with pg_basebackup
+
+Run `pg_basebackup` on the standby host to create an initial copy of the primary:
+
+```bash
+# Create the standby data directory
+pg_basebackup -h 192.168.1.50 -U replicator \
+  -D /var/lib/pgsql/standby \
+  -P \
+  --wal-method=stream \
+  -R   # write standby.signal and primary_conninfo automatically
+```
+
+The `-R` flag writes `standby.signal` and adds `primary_conninfo` to `postgresql.auto.conf` on the standby, which is all you need for a basic streaming replication setup.
+
+## Configuring the standby manually
+
+If you did not use `-R`, configure the standby manually:
+
+<Steps>
+  <Step title="Create standby.signal">
+    ```bash
+    touch /var/lib/pgsql/standby/standby.signal
+    ```
+
+    The presence of `standby.signal` tells PostgreSQL to start in continuous recovery (standby) mode.
+  </Step>
+
+  <Step title="Set primary_conninfo">
+    Add to `postgresql.conf` on the standby:
+
+    ```ini postgresql.conf  (standby)
+    primary_conninfo = 'host=192.168.1.50 port=5432 user=replicator password=replpass application_name=standby1'
+    hot_standby = on
+    recovery_target_timeline = 'latest'
+    ```
+  </Step>
+</Steps>
+
+## Using a replication slot
+
+A replication slot prevents the primary from discarding WAL that the standby has not yet received, at the cost of potential WAL accumulation.
+
+Create a physical replication slot on the primary:
+
+```sql
+SELECT pg_create_physical_replication_slot('standby1_slot');
+```
+
+Verify the slot:
+
+```sql
+SELECT slot_name, slot_type, active, restart_lsn
+FROM pg_replication_slots;
+```
+
+Configure the standby to use the slot:
+
+```ini postgresql.conf  (standby)
+primary_conninfo = 'host=192.168.1.50 port=5432 user=replicator password=replpass'
+primary_slot_name = 'standby1_slot'
+```
+
+<Warning>
+  If the standby goes offline for an extended period, the slot causes WAL to accumulate on the primary indefinitely. Set `max_slot_wal_keep_size` in `postgresql.conf` to limit this. An invalidated slot must be dropped and the standby re-seeded.
+</Warning>
+
+## Starting the standby
+
+```bash
+pg_ctl start -D /var/lib/pgsql/standby -l /var/log/postgresql/standby.log
+```
+
+After startup you should see a `walreceiver` process on the standby and a corresponding `walsender` process on the primary:
+
+```bash
+# On the standby
+ps aux | grep walreceiver
+
+# On the primary
+ps aux | grep walsender
+```
+
+## Monitoring replication
+
+### On the primary: pg_stat_replication
+
+```sql
+SELECT application_name,
+       state,
+       sent_lsn,
+       write_lsn,
+       flush_lsn,
+       replay_lsn,
+       write_lag,
+       flush_lag,
+       replay_lag,
+       sync_state
+FROM pg_stat_replication;
+```
+
+Key columns:
+
+| Column | Description |
+|--------|-------------|
+| `sent_lsn` | Last WAL position sent to standby |
+| `write_lsn` | Last WAL written to standby's disk |
+| `flush_lsn` | Last WAL flushed to standby's disk |
+| `replay_lsn` | Last WAL applied on standby |
+| `write_lag` | Delay from flush on primary to write on standby |
+| `flush_lag` | Delay from flush on primary to flush on standby |
+| `replay_lag` | Delay from flush on primary to apply on standby |
+| `sync_state` | `async`, `sync`, `potential`, or `quorum` |
+
+### Calculate replication lag in bytes
+
+```sql
+-- On the primary
+SELECT application_name,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_lag_bytes
+FROM pg_stat_replication;
+```
+
+### On the standby: pg_stat_wal_receiver
+
+```sql
+SELECT status,
+       receive_start_lsn,
+       received_lsn,
+       last_msg_send_time,
+       last_msg_receipt_time,
+       latency_ms
+FROM pg_stat_wal_receiver;
+```
+
+### Check if a server is in recovery
+
+```sql
+SELECT pg_is_in_recovery();   -- true on standby, false on primary
+SELECT pg_last_wal_replay_lsn();
+SELECT pg_last_xact_replay_timestamp();
+```
+
+## Synchronous replication
+
+To require at least one standby to confirm WAL receipt before commits complete:
+
+```ini postgresql.conf  (primary)
+synchronous_standby_names = 'standby1'
+synchronous_commit = on
+```
+
+The standby's `application_name` in `primary_conninfo` must match the name in `synchronous_standby_names`.
+
+For quorum-based synchronous replication with multiple standbys:
+
+```ini
+synchronous_standby_names = 'ANY 1 (standby1, standby2, standby3)'
+```
+
+This requires any one of the three standbys to confirm before the commit returns.
+
+## Failover procedure
+
+<Steps>
+  <Step title="Confirm the primary is down">
+    Verify the primary is truly unreachable. Promoting a standby while the primary is still running can cause split-brain.
+  </Step>
+  <Step title="Promote the standby">
+    ```bash
+    pg_ctl promote -D /var/lib/pgsql/standby
+    ```
+
+    Or from SQL:
+
+    ```sql
+    SELECT pg_promote();
+    ```
+  </Step>
+  <Step title="Point other standbys to the new primary">
+    Update `primary_conninfo` on any remaining standbys and restart them, or use `pg_rewind` to re-sync the old primary if it comes back.
+  </Step>
+</Steps>
+
+## Cascading replication
+
+A standby can relay WAL to additional downstream standbys, reducing load on the primary:
+
+```ini postgresql.conf  (cascading standby)
+max_wal_senders = 3   # allow downstream standbys to connect
+hot_standby = on
+```
+
+Downstream standbys set `primary_conninfo` to point to the cascading standby's address rather than the primary.

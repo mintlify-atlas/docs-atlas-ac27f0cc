@@ -1,0 +1,278 @@
+---
+title: Custom index access methods
+description: Implement a custom index access method using the IndexAmRoutine API. Covers required AM callbacks (aminsert, ambeginscan, amgettuple, amendscan), operator classes for custom types, and an overview of the Table Access Method API.
+---
+
+PostgreSQL's index access method (AM) API allows you to plug in entirely new index structures. Built-in methods include B-tree, Hash, GiST, GIN, SP-GiST, and BRIN. You can define additional methods by implementing the `IndexAmRoutine` interface.
+
+<Note>
+Writing a custom index access method requires deep familiarity with PostgreSQL internals. For most use cases, using an existing method (especially GiST or GIN) with a custom operator class is simpler and sufficient.
+</Note>
+
+## Index method registration
+
+Register a new index access method by:
+
+1. Writing a handler function in C that returns a filled-in `IndexAmRoutine` struct.
+2. Declaring it with `CREATE ACCESS METHOD`.
+
+```sql
+CREATE ACCESS METHOD my_index TYPE INDEX HANDLER my_index_handler;
+```
+
+The handler function has this signature:
+
+```c
+#include "postgres.h"
+#include "fmgr.h"
+#include "access/amapi.h"
+
+PG_MODULE_MAGIC;
+
+PG_FUNCTION_INFO_V1(my_index_handler);
+
+Datum
+my_index_handler(PG_FUNCTION_ARGS)
+{
+    IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+    /* Fill in capabilities flags */
+    amroutine->amstrategies   = 5;   /* number of operator strategies */
+    amroutine->amsupport      = 1;   /* number of support functions */
+    amroutine->amcanmulticol  = true;
+    amroutine->amsearcharray  = true;
+    amroutine->amsearchnulls  = true;
+    amroutine->amstorage      = false;
+    amroutine->amclusterable  = true;
+    amroutine->ampredlocks    = true;
+    amroutine->amcanparallel  = false;
+    amroutine->amcaninclude   = true;
+    amroutine->amusemaintenanceworkmem = false;
+    amroutine->amoptsprocnum  = 0;
+
+    /* Required callbacks */
+    amroutine->amvalidate     = my_amvalidate;
+    amroutine->ambuild        = my_ambuild;
+    amroutine->ambuildempty   = my_ambuildempty;
+    amroutine->aminsert       = my_aminsert;
+    amroutine->aminsertcleanup = NULL;
+    amroutine->ambulkdelete   = my_ambulkdelete;
+    amroutine->amvacuumcleanup = my_amvacuumcleanup;
+    amroutine->amcanreturn    = NULL;
+    amroutine->amcostestimate = my_amcostestimate;
+    amroutine->amoptions      = my_amoptions;
+    amroutine->amproperty     = NULL;
+    amroutine->ambeginscan    = my_ambeginscan;
+    amroutine->amrescan       = my_amrescan;
+    amroutine->amgettuple     = my_amgettuple;
+    amroutine->amgetbitmap    = NULL;
+    amroutine->amendscan      = my_amendscan;
+    amroutine->ammarkpos      = NULL;
+    amroutine->amrestrpos     = NULL;
+    amroutine->amestimateparallelscan = NULL;
+    amroutine->aminitparallelscan = NULL;
+    amroutine->amparallelrescan = NULL;
+
+    PG_RETURN_POINTER(amroutine);
+}
+```
+
+## Required AM callbacks
+
+### aminsert — insert a tuple into the index
+
+```c
+bool
+aminsert(Relation indexRelation,
+          Datum *values,
+          bool *isnull,
+          ItemPointer heap_tid,
+          Relation heapRelation,
+          IndexUniqueCheck checkUnique,
+          bool indexUnchanged,
+          IndexInfo *indexInfo);
+```
+
+Inserts the index entry for one heap tuple identified by `heap_tid`. `values` and `isnull` contain the indexed column values. The function returns true if a unique index violation was detected.
+
+### ambuild — build a new index
+
+```c
+IndexBuildResult *
+ambuild(Relation heapRelation,
+        Relation indexRelation,
+        IndexInfo *indexInfo);
+```
+
+Builds the initial index from scratch. Typically calls `IndexBuildHeapScan` to iterate over heap tuples and calls `aminsert` for each one. Returns row and tuple counts.
+
+### ambuildempty — create an empty index
+
+```c
+void
+ambuildempty(Relation indexRelation);
+```
+
+Builds an empty index. Called when creating an index on an empty table or initializing a new index file.
+
+### ambulkdelete — bulk delete index entries
+
+```c
+IndexBulkDeleteResult *
+ambulkdelete(IndexVacuumInfo *info,
+             IndexBulkDeleteResult *stats,
+             IndexBulkDeleteCallback callback,
+             void *callback_state);
+```
+
+Removes all index entries for which `callback(tid, callback_state)` returns true. Called during VACUUM.
+
+### amvacuumcleanup — post-VACUUM cleanup
+
+```c
+IndexBulkDeleteResult *
+amvacuumcleanup(IndexVacuumInfo *info,
+                IndexBulkDeleteResult *stats);
+```
+
+Called after one or more `ambulkdelete` passes. Cleans up index-internal structures and returns updated statistics.
+
+### amcostestimate — estimate scan cost
+
+```c
+void
+amcostestimate(PlannerInfo *root,
+               IndexPath *path,
+               double loop_count,
+               Cost *indexStartupCost,
+               Cost *indexTotalCost,
+               Selectivity *indexSelectivity,
+               double *indexCorrelation,
+               double *indexPages);
+```
+
+Estimates the cost of an index scan. The planner uses these estimates to choose among access paths.
+
+### ambeginscan — start an index scan
+
+```c
+IndexScanDesc
+ambeginscan(Relation indexRelation,
+            int nkeys,
+            int norderbys);
+```
+
+Allocates and initializes an `IndexScanDesc`. Sets `scan->opaque` to any private state the AM needs to track the scan.
+
+### amrescan — restart or initialize a scan
+
+```c
+void
+amrescan(IndexScanDesc scan,
+          ScanKey keys,
+          int nkeys,
+          ScanKey orderbys,
+          int norderbys);
+```
+
+Sets or resets the scan keys. Called after `ambeginscan` and when re-scanning (e.g., an inner side of a nested loop).
+
+### amgettuple — fetch the next tuple
+
+```c
+bool
+amgettuple(IndexScanDesc scan,
+           ScanDirection direction);
+```
+
+Fetches the next tuple matching the scan keys, in `direction` order. Sets `scan->xs_heaptid` to the heap TID and returns true if a tuple was found, or false if no more tuples exist.
+
+### amendscan — end a scan
+
+```c
+void
+amendscan(IndexScanDesc scan);
+```
+
+Releases resources used by the scan. Does not drop the `IndexScanDesc` itself (that is handled by the caller).
+
+### amoptions — parse index storage parameters
+
+```c
+bytea *
+amoptions(Datum reloptions,
+          bool validate);
+```
+
+Parses and validates `WITH (...)` storage options for the index. Return NULL to indicate no options are accepted.
+
+### amvalidate — validate an operator class
+
+```c
+bool
+amvalidate(Oid opclassoid);
+```
+
+Verifies that an operator class provides all the operators and support functions required by the AM. Returns true if valid.
+
+## IndexAmRoutine capability flags
+
+| Flag | Meaning |
+|------|---------|
+| `amstrategies` | Number of operator strategies the AM recognizes |
+| `amsupport` | Number of support functions the AM requires |
+| `amcanmulticol` | Can index multiple columns |
+| `amsearcharray` | Can handle `ScalarArrayOpExpr` quals (e.g., `col = ANY(array)`) |
+| `amsearchnulls` | Can search for NULL/NOT NULL |
+| `amstorage` | Index stores different type than the column (e.g., for GIN) |
+| `amclusterable` | Can be used for `CLUSTER` |
+| `ampredlocks` | Supports predicate locking for serializable isolation |
+| `amcanparallel` | Supports parallel index scans |
+| `amcaninclude` | Supports `INCLUDE` columns |
+
+## Operator classes for custom index types
+
+For users to create an index with `USING my_index` on a column, they need an operator class for that index method and data type:
+
+```sql
+CREATE OPERATOR CLASS my_type_ops
+    DEFAULT FOR TYPE my_type USING my_index AS
+        OPERATOR 1  = (my_type, my_type),
+        OPERATOR 2  < (my_type, my_type),
+        FUNCTION 1  my_type_cmp(my_type, my_type);
+```
+
+The strategy numbers and support function numbers must match what your AM handler declares in `amstrategies` and `amsupport`.
+
+## Table Access Method API
+
+In addition to index access methods, PostgreSQL supports custom **table access methods** (storage engines) via the `TableAmRoutine` interface, declared in `src/include/access/tableam.h`.
+
+A table AM is registered with:
+
+```sql
+CREATE ACCESS METHOD my_table_am TYPE TABLE HANDLER my_table_handler;
+```
+
+A table can be created using the AM:
+
+```sql
+CREATE TABLE my_table (id int, data text)
+    USING my_table_am;
+```
+
+The `TableAmRoutine` struct has callbacks for:
+
+| Callback group | Examples |
+|----------------|----------|
+| Slot operations | `slot_callbacks` |
+| Sequential scan | `scan_begin`, `scan_getnextslot`, `scan_end` |
+| Tuple insertion | `tuple_insert`, `tuple_insert_speculative` |
+| Tuple update/delete | `tuple_update`, `tuple_delete` |
+| Tuple fetch | `tuple_fetch_row_version`, `tuple_tid_valid` |
+| Visibility | `tuple_satisfies_snapshot` |
+| VACUUM | `relation_vacuum`, `relation_nontransactional_truncate` |
+| DDL | `relation_set_new_filelocator`, `relation_copy_data` |
+| ANALYZE | `relation_analyze` |
+
+The heap table AM (`heapam`) in `src/backend/access/heap/` is the reference implementation.

@@ -1,0 +1,192 @@
+---
+title: pg_ctl
+description: Control the PostgreSQL server process — initialize, start, stop, restart, reload, and more.
+---
+
+`pg_ctl` is a utility for initializing, starting, stopping, and controlling the PostgreSQL server.
+
+## Synopsis
+
+```bash
+pg_ctl init[db]  [-D DATADIR] [-s] [-o OPTIONS]
+pg_ctl start     [-D DATADIR] [-l FILENAME] [-W] [-t SECS] [-s] [-o OPTIONS]
+pg_ctl stop      [-D DATADIR] [-m SHUTDOWN-MODE] [-W] [-t SECS] [-s]
+pg_ctl restart   [-D DATADIR] [-m SHUTDOWN-MODE] [-W] [-t SECS] [-s] [-o OPTIONS]
+pg_ctl reload    [-D DATADIR] [-s]
+pg_ctl status    [-D DATADIR]
+pg_ctl promote   [-D DATADIR] [-W] [-t SECS] [-s]
+pg_ctl logrotate [-D DATADIR] [-s]
+pg_ctl kill      SIGNALNAME PID
+```
+
+## Common options
+
+| Flag | Description |
+|------|-------------|
+| `-D DATADIR` / `--pgdata` | Location of the database data directory. Defaults to the `PGDATA` environment variable. |
+| `-l FILENAME` / `--log` | Write (or append) server log output to this file. |
+| `-m MODE` / `--mode` | Shutdown mode: `smart`, `fast`, or `immediate`. |
+| `-o OPTIONS` / `--options` | Pass additional options to `postgres` (the server executable) or `initdb`. |
+| `-s` / `--silent` | Print only errors, suppress informational messages. |
+| `-t SECS` / `--timeout` | Seconds to wait when using `-w` (default: 60). |
+| `-w` / `--wait` | Wait for the operation to complete before returning (default). |
+| `-W` / `--no-wait` | Do not wait for the operation to complete. |
+
+If `-D` is omitted, the `PGDATA` environment variable must be set.
+
+## Commands
+
+### init
+
+Initializes a new database cluster by running `initdb`:
+
+```bash
+pg_ctl init -D /var/lib/postgresql/17/main
+
+# Pass options to initdb
+pg_ctl init -D /data/pg -o "--encoding=UTF8 --locale=en_US.UTF-8"
+```
+
+### start
+
+Starts the PostgreSQL server. By default, `pg_ctl` waits for the server to be ready to accept connections before returning.
+
+```bash
+pg_ctl start -D /var/lib/postgresql/17/main
+
+# Start with a log file
+pg_ctl start -D /var/lib/postgresql/17/main -l /var/log/postgresql/postgresql.log
+
+# Pass additional server options
+pg_ctl start -D /data/pg -o "-c max_connections=200 -c shared_buffers=2GB"
+
+# Start and do not wait for server to be ready
+pg_ctl start -D /data/pg -W
+```
+
+### stop
+
+Stops the PostgreSQL server.
+
+```bash
+# Fast shutdown (default): disconnect all clients immediately, then shut down
+pg_ctl stop -D /var/lib/postgresql/17/main
+
+# Specify shutdown mode
+pg_ctl stop -D /data/pg -m smart
+pg_ctl stop -D /data/pg -m fast
+pg_ctl stop -D /data/pg -m immediate
+```
+
+#### Shutdown modes
+
+| Mode | Signal | Description |
+|------|--------|-------------|
+| `smart` | SIGTERM | Wait for all clients to disconnect before shutting down. |
+| `fast` | SIGINT | Disconnect all clients immediately and shut down cleanly. This is the default. |
+| `immediate` | SIGQUIT | Quit immediately without clean shutdown. The next startup will run recovery. |
+
+<Warning>
+Use `immediate` mode only in emergencies. It skips the checkpoint and shutdown sequence, which means recovery is required on the next start.
+</Warning>
+
+### restart
+
+Stops then starts the server. Useful after changing `postgresql.conf` settings that require a restart:
+
+```bash
+pg_ctl restart -D /var/lib/postgresql/17/main
+
+# Restart with fast shutdown
+pg_ctl restart -D /data/pg -m fast
+```
+
+### reload
+
+Sends SIGHUP to the server, causing it to re-read `postgresql.conf` and `pg_hba.conf` without restarting. Use this for settings that do not require a restart (such as `log_min_duration_statement` or changes to `pg_hba.conf`):
+
+```bash
+pg_ctl reload -D /var/lib/postgresql/17/main
+```
+
+<Note>
+Not all configuration parameters can be changed with reload. Parameters marked `requires_restart` in `pg_settings.context` require a full restart.
+</Note>
+
+### status
+
+Reports whether the server is running and its PID:
+
+```bash
+pg_ctl status -D /var/lib/postgresql/17/main
+# pg_ctl: server is running (PID: 12345)
+```
+
+### promote
+
+Promotes a standby server to become the primary. The standby must be in recovery (streaming or file-based):
+
+```bash
+pg_ctl promote -D /var/lib/postgresql/17/standby
+```
+
+### logrotate
+
+Requests the server to close and reopen its log file. Useful when rotating log files managed externally:
+
+```bash
+pg_ctl logrotate -D /var/lib/postgresql/17/main
+```
+
+## Timeout and wait behavior
+
+By default, `pg_ctl start`, `stop`, `restart`, and `promote` wait for the operation to complete (up to 60 seconds). Increase the timeout with `-t`:
+
+```bash
+pg_ctl start -D /data/pg -t 120
+```
+
+## Using PGDATA
+
+If the `PGDATA` environment variable is set, you can omit `-D`:
+
+```bash
+export PGDATA=/var/lib/postgresql/17/main
+pg_ctl start
+pg_ctl status
+pg_ctl stop
+```
+
+## systemd service (alternative)
+
+On Linux systems managed by systemd, using the systemd service is preferred over `pg_ctl` for production environments. Here is a typical unit file:
+
+```ini
+# /etc/systemd/system/postgresql.service
+[Unit]
+Description=PostgreSQL Database Server
+After=network.target
+
+[Service]
+Type=forking
+User=postgres
+Environment=PGDATA=/var/lib/postgresql/17/main
+ExecStart=/usr/lib/postgresql/17/bin/pg_ctl start -D ${PGDATA} -l /var/log/postgresql/postgresql.log
+ExecStop=/usr/lib/postgresql/17/bin/pg_ctl stop -D ${PGDATA} -m fast
+ExecReload=/usr/lib/postgresql/17/bin/pg_ctl reload -D ${PGDATA}
+TimeoutSec=120
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Usage:
+
+```bash
+systemctl start postgresql
+systemctl stop postgresql
+systemctl reload postgresql
+systemctl status postgresql
+```
+
+Distribution packages for PostgreSQL (from PGDG or OS packages) typically provide a ready-made systemd service file.

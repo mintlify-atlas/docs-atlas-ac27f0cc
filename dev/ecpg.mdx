@@ -1,0 +1,375 @@
+---
+title: ECPG — Embedded SQL in C
+description: Write PostgreSQL queries directly in C source code using Embedded SQL (ECPG). Covers the EXEC SQL syntax, precompiling, host variables, cursors, and error handling.
+---
+
+ECPG is the embedded SQL preprocessor for PostgreSQL. It lets you write standard SQL statements directly in C source files. The preprocessor converts them to calls through the `ecpglib` library, which communicates with the server via libpq.
+
+Embedded SQL has three main advantages over hand-written libpq code:
+
+<CardGroup cols={3}>
+  <Card title="Type safety" icon="shield-check">
+    Host variables are declared with C types; the preprocessor handles conversions.
+  </Card>
+  <Card title="Build-time checking" icon="magnifying-glass">
+    SQL syntax is checked at precompile time, not at runtime.
+  </Card>
+  <Card title="Portability" icon="globe">
+    Embedded SQL in C is an ISO SQL standard, supported by many databases.
+  </Card>
+</CardGroup>
+
+## The preprocessing workflow
+
+Source files use the extension `.pgc`. The build pipeline is:
+
+<Steps>
+  <Step title="Write your .pgc file">
+    Mix ordinary C code with `EXEC SQL` statements.
+  </Step>
+  <Step title="Run the ecpg preprocessor">
+    ```bash
+    ecpg myapp.pgc
+    ```
+    This produces `myapp.c` — a standard C file.
+  </Step>
+  <Step title="Compile with your C compiler">
+    ```bash
+    gcc myapp.c -o myapp \
+        $(pg_config --cflags) \
+        -I$(pg_config --includedir) \
+        -lecpg -lpq
+    ```
+  </Step>
+</Steps>
+
+## EXEC SQL syntax
+
+All embedded SQL statements have the form:
+
+```c
+EXEC SQL statement;
+```
+
+These take the syntactic place of C statements. They can appear at the global level or inside functions. SQL keywords are case-insensitive; C code is not.
+
+## Managing database connections
+
+### Connecting to the server
+
+```c
+EXEC SQL CONNECT TO target [AS connection-name] [USER user-name];
+```
+
+The `target` can be specified several ways:
+
+```c
+/* Simple dbname@host:port */
+EXEC SQL CONNECT TO mydb@localhost:5432;
+
+/* TCP URI */
+EXEC SQL CONNECT TO "tcp:postgresql://localhost:5432/mydb";
+
+/* Unix socket URI */
+EXEC SQL CONNECT TO "unix:postgresql://localhost/mydb";
+
+/* Default (uses environment variables / defaults) */
+EXEC SQL CONNECT TO DEFAULT;
+
+/* With explicit username */
+EXEC SQL CONNECT TO mydb@localhost USER myuser IDENTIFIED BY mypassword;
+
+/* Using a C string variable */
+EXEC SQL CONNECT TO :connstring;
+```
+
+### Named connections
+
+You can maintain multiple connections simultaneously:
+
+```c
+EXEC SQL CONNECT TO db1 AS conn1;
+EXEC SQL CONNECT TO db2 AS conn2;
+
+/* Switch active connection */
+EXEC SQL SET CONNECTION conn1;
+
+/* Disconnect */
+EXEC SQL DISCONNECT conn1;
+EXEC SQL DISCONNECT ALL;
+```
+
+## Host variables
+
+Host variables are ordinary C variables that can be used inside SQL statements, prefixed with a colon (`:`).
+
+```c
+EXEC SQL BEGIN DECLARE SECTION;
+    int    user_id;
+    char   username[100];
+    double salary;
+    int    indicator_var;  /* for NULL detection */
+EXEC SQL END DECLARE SECTION;
+```
+
+<Note>
+Variables must be declared between `BEGIN DECLARE SECTION` and `END DECLARE SECTION` to be accessible to the preprocessor.
+</Note>
+
+### NULL indicators
+
+To handle SQL NULLs, declare an indicator variable of type `short` and reference it with `:variable:indicator`:
+
+```c
+EXEC SQL BEGIN DECLARE SECTION;
+    int   user_id;
+    short user_id_ind;   /* indicator: -1 = NULL, 0 = not NULL */
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL SELECT id INTO :user_id:user_id_ind FROM users WHERE name = 'Alice';
+
+if (user_id_ind == -1)
+    printf("id is NULL\n");
+```
+
+## Executing SQL statements
+
+### SELECT INTO — single row
+
+```c
+EXEC SQL BEGIN DECLARE SECTION;
+    int  id;
+    char name[50];
+    int  age;
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL SELECT id, name, age
+         INTO :id, :name, :age
+         FROM employees
+         WHERE name = 'Bob';
+```
+
+### INSERT
+
+```c
+EXEC SQL BEGIN DECLARE SECTION;
+    int  new_id   = 42;
+    char new_name[] = "Carol";
+    int  new_age  = 30;
+EXEC SQL END DECLARE SECTION;
+
+EXEC SQL INSERT INTO employees (id, name, age)
+         VALUES (:new_id, :new_name, :new_age);
+```
+
+### UPDATE and DELETE
+
+```c
+EXEC SQL UPDATE employees SET age = :new_age WHERE id = :id;
+EXEC SQL DELETE FROM employees WHERE id = :id;
+```
+
+### EXECUTE with parameters
+
+For dynamic SQL:
+
+```c
+EXEC SQL BEGIN DECLARE SECTION;
+    char query[200];
+EXEC SQL END DECLARE SECTION;
+
+sprintf(query, "UPDATE accounts SET balance = balance + %d WHERE id = %d",
+        amount, account_id);
+EXEC SQL EXECUTE IMMEDIATE :query;
+```
+
+## Cursors
+
+Cursors allow you to iterate over result sets row by row.
+
+<Steps>
+  <Step title="Declare the cursor">
+    ```c
+    EXEC SQL DECLARE my_cursor CURSOR FOR
+        SELECT id, name, salary FROM employees ORDER BY id;
+    ```
+  </Step>
+  <Step title="Open the cursor">
+    ```c
+    EXEC SQL OPEN my_cursor;
+    ```
+  </Step>
+  <Step title="Fetch rows">
+    ```c
+    EXEC SQL BEGIN DECLARE SECTION;
+        int  emp_id;
+        char emp_name[50];
+        double emp_salary;
+    EXEC SQL END DECLARE SECTION;
+
+    while (1) {
+        EXEC SQL FETCH NEXT FROM my_cursor
+            INTO :emp_id, :emp_name, :emp_salary;
+
+        if (sqlca.sqlcode == ECPG_NOT_FOUND)
+            break;
+
+        printf("%d  %-30s  %.2f\n", emp_id, emp_name, emp_salary);
+    }
+    ```
+  </Step>
+  <Step title="Close the cursor">
+    ```c
+    EXEC SQL CLOSE my_cursor;
+    ```
+  </Step>
+</Steps>
+
+### Scrollable cursors
+
+```c
+EXEC SQL DECLARE scroll_cur SCROLL CURSOR FOR
+    SELECT * FROM products ORDER BY price;
+
+EXEC SQL OPEN scroll_cur;
+EXEC SQL FETCH LAST FROM scroll_cur INTO :id, :name, :price;
+EXEC SQL FETCH RELATIVE -5 FROM scroll_cur INTO :id, :name, :price;
+EXEC SQL FETCH ABSOLUTE 10 FROM scroll_cur INTO :id, :name, :price;
+EXEC SQL CLOSE scroll_cur;
+```
+
+## Error handling
+
+### WHENEVER
+
+The `WHENEVER` directive sets up automatic error handling for SQL conditions:
+
+```c
+/* Abort on any SQL error */
+EXEC SQL WHENEVER SQLERROR STOP;
+
+/* Call a function on NOT FOUND */
+EXEC SQL WHENEVER NOT FOUND DO handle_not_found();
+
+/* Jump to a label on SQLERROR */
+EXEC SQL WHENEVER SQLERROR GOTO error_handler;
+
+/* Continue (disable a previous WHENEVER) */
+EXEC SQL WHENEVER SQLERROR CONTINUE;
+```
+
+The three conditions are:
+
+| Condition | Meaning |
+|-----------|---------|
+| `SQLERROR` | An error occurred (non-zero negative SQLSTATE code) |
+| `SQLWARNING` | A warning was issued |
+| `NOT FOUND` | A query returned zero rows |
+
+Actions can be `STOP`, `CONTINUE`, `GOTO label`, `DO function()`, or `DO BREAK`.
+
+### sqlca — the SQL Communication Area
+
+`sqlca` is a global C struct populated after each SQL statement:
+
+```c
+struct sqlca_t {
+    char    sqlcaid[8];      /* "SQLCA   " */
+    long    sqlabc;
+    long    sqlcode;         /* 0 = success, >0 = warning, <0 = error */
+    struct {
+        int     sqlerrml;
+        char    sqlerrmc[SQLERRMC_LEN];
+    } sqlerrm;               /* error message text */
+    char    sqlerrp[8];
+    long    sqlerrd[6];      /* sqlerrd[2] = rows processed */
+    char    sqlwarn[8];      /* warning flags */
+    char    sqlstate[5];     /* SQLSTATE code */
+};
+```
+
+Key fields:
+
+- `sqlca.sqlcode` — 0 on success, `ECPG_NOT_FOUND` (100) when no rows found, negative on error
+- `sqlca.sqlerrm.sqlerrmc` — error message string
+- `sqlca.sqlerrd[2]` — number of rows processed by the last command
+- `sqlca.sqlstate` — five-character SQLSTATE code
+
+## Complete minimal example
+
+```c
+/*
+ * minimal.pgc — connect, insert, query, disconnect
+ * Build: ecpg minimal.pgc && gcc minimal.c -o minimal -lecpg -lpq
+ */
+#include <stdio.h>
+#include <stdlib.h>
+
+EXEC SQL INCLUDE sqlca;
+
+void sql_error(void)
+{
+    fprintf(stderr, "SQL error: %s (code %ld)\n",
+            sqlca.sqlerrm.sqlerrmc, sqlca.sqlcode);
+    EXEC SQL DISCONNECT ALL;
+    exit(1);
+}
+
+int main(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char  connstr[] = "host=localhost dbname=testdb";
+        int   id;
+        char  name[64];
+        float balance;
+    EXEC SQL END DECLARE SECTION;
+
+    /* Error handling */
+    EXEC SQL WHENEVER SQLERROR DO sql_error();
+
+    /* Connect */
+    EXEC SQL CONNECT TO :connstr;
+    printf("Connected.\n");
+
+    /* Insert a row */
+    id = 1;
+    sprintf(name, "Alice");
+    balance = 1000.00;
+    EXEC SQL INSERT INTO accounts (id, name, balance)
+             VALUES (:id, :name, :balance);
+    EXEC SQL COMMIT;
+    printf("Inserted %ld row(s).\n", sqlca.sqlerrd[2]);
+
+    /* Query using a cursor */
+    EXEC SQL DECLARE acct_cur CURSOR FOR
+        SELECT id, name, balance FROM accounts ORDER BY id;
+    EXEC SQL OPEN acct_cur;
+
+    EXEC SQL WHENEVER NOT FOUND DO BREAK;
+    while (1) {
+        EXEC SQL FETCH NEXT FROM acct_cur INTO :id, :name, :balance;
+        printf("  %d  %-20s  %.2f\n", id, name, balance);
+    }
+    EXEC SQL WHENEVER NOT FOUND CONTINUE;
+
+    EXEC SQL CLOSE acct_cur;
+    EXEC SQL DISCONNECT;
+    return 0;
+}
+```
+
+## Transaction control
+
+```c
+EXEC SQL BEGIN;         /* start a transaction (in autocommit-off mode) */
+EXEC SQL COMMIT;
+EXEC SQL ROLLBACK;
+EXEC SQL SAVEPOINT sp1;
+EXEC SQL ROLLBACK TO SAVEPOINT sp1;
+```
+
+By default, `ecpglib` runs in autocommit mode (each statement is its own transaction). To use explicit transactions, set `autocommit` to `off`:
+
+```c
+EXEC SQL SET autocommit TO off;
+```

@@ -1,0 +1,246 @@
+---
+title: Custom operators
+description: Define new SQL operators with CREATE OPERATOR and attach optimizer hints (commutator, negator, restrict, join). Create operator classes and operator families to support indexing.
+---
+
+An operator is syntactic sugar for a call to an underlying function. But it is not *merely* syntactic sugar: an operator declaration can carry additional information that the query planner uses to optimize queries. Providing accurate optimizer hints can dramatically improve query performance.
+
+## Creating an operator
+
+You must create the underlying function before creating the operator:
+
+```sql
+-- Underlying function
+CREATE FUNCTION complex_add(complex, complex)
+    RETURNS complex
+    AS '$libdir/complex', 'complex_add'
+    LANGUAGE C IMMUTABLE STRICT;
+
+-- Operator
+CREATE OPERATOR + (
+    leftarg    = complex,
+    rightarg   = complex,
+    function   = complex_add,
+    commutator = +
+);
+```
+
+Now you can write:
+
+```sql
+SELECT (a + b) AS c FROM test_complex;
+```
+
+### CREATE OPERATOR syntax
+
+```sql
+CREATE OPERATOR name (
+    { FUNCTION | PROCEDURE } = function_name
+    [, LEFTARG = left_type ]
+    [, RIGHTARG = right_type ]
+    [, COMMUTATOR = com_op ]
+    [, NEGATOR = neg_op ]
+    [, RESTRICT = res_proc ]
+    [, JOIN = join_proc ]
+    [, HASHES ]
+    [, MERGES ]
+);
+```
+
+- `FUNCTION` (or `LEFTARG`/`RIGHTARG`) are required. Everything else is optional.
+- Omit `LEFTARG` to create a prefix operator.
+- The `name` can be any sequence of operator characters (e.g., `+`, `<>`, `@@@`).
+
+## Optimizer hints
+
+Providing optimizer hints is important. Incorrect hints can produce wrong results or slow queries; missing hints simply cause the planner to miss optimizations.
+
+### COMMUTATOR
+
+Operator A is the commutator of operator B if `(x A y) = (y B x)` for all valid inputs. For example, `<` and `>` are commutators of each other; `+` is its own commutator.
+
+The commutator hint lets the planner flip join conditions and WHERE clauses to match index scan requirements. Without it, the planner cannot use an index on `tab2.y` when the query is written as `tab1.x = tab2.y` if only `tab2.y = tab1.x` form matches the index.
+
+```sql
+CREATE OPERATOR < (
+    leftarg    = complex,
+    rightarg   = complex,
+    function   = complex_lt,
+    commutator = >,      -- < and > are commutators
+    negator    = >=,
+    restrict   = scalarltsel,
+    join       = scalarltjoinsel
+);
+```
+
+### NEGATOR
+
+Operator A is the negator of operator B if `(x A y) = NOT (x B y)`. For example, `<` and `>=` are negators.
+
+The negator hint allows the planner to simplify `NOT (x = y)` to `x <> y`, which is important because `NOT` is frequently inserted as a result of other planner transformations.
+
+### RESTRICT
+
+`RESTRICT` names a function that estimates what fraction of rows in a table will satisfy a WHERE clause condition of the form `column OP constant`. This is a **selectivity estimator** for restriction clauses.
+
+For a new operator that behaves like `=` on a numeric type, you can reuse the built-in estimator:
+
+```sql
+CREATE OPERATOR = (
+    leftarg  = complex,
+    rightarg = complex,
+    function = complex_eq,
+    restrict = eqsel       -- built-in equality selectivity estimator
+);
+```
+
+Built-in selectivity estimators:
+
+| Estimator | Use for |
+|-----------|---------|
+| `eqsel` | Equality: `=` |
+| `neqsel` | Inequality: `<>` |
+| `scalarltsel` | Less-than on a scalar: `<` |
+| `scalargtsel` | Greater-than on a scalar: `>` |
+| `scalarlesel` | Less-or-equal: `<=` |
+| `scalargesel` | Greater-or-equal: `>=` |
+
+### JOIN
+
+`JOIN` names a function that estimates the number of rows satisfying a join condition `table1.col1 OP table2.col2`.
+
+```sql
+CREATE OPERATOR = (
+    leftarg  = complex,
+    rightarg = complex,
+    function = complex_eq,
+    restrict = eqsel,
+    join     = eqjoinsel   -- built-in equality join estimator
+);
+```
+
+Built-in join estimators: `eqjoinsel`, `neqjoinsel`, `scalarltjoinsel`, `scalargtjoinsel`, `scalarlejoinsel`, `scalargejoinsel`.
+
+### HASHES and MERGES
+
+- `HASHES` — tells the planner that the operator is suitable for a hash join. Only specify this for equality operators where equal values always have the same hash.
+- `MERGES` — tells the planner that the operator is suitable for a merge join. Only specify this for equality operators that have a compatible ordering.
+
+## Operator classes
+
+Operator classes allow indexes to use your operators. An operator class defines which operators and support functions an index method uses for a particular data type.
+
+### CREATE OPERATOR CLASS
+
+```sql
+CREATE OPERATOR CLASS complex_abs_ops
+    DEFAULT FOR TYPE complex USING btree AS
+        OPERATOR 1  <   (complex, complex),
+        OPERATOR 2  <=  (complex, complex),
+        OPERATOR 3  =   (complex, complex),
+        OPERATOR 4  >=  (complex, complex),
+        OPERATOR 5  >   (complex, complex),
+        FUNCTION 1  complex_abs_cmp(complex, complex);
+```
+
+The `DEFAULT` keyword makes this the default operator class for the type and index method.
+
+### B-tree strategy numbers
+
+B-tree requires five strategies in a strict ordering:
+
+| Strategy | Meaning |
+|----------|---------|
+| 1 | less than |
+| 2 | less than or equal |
+| 3 | equal |
+| 4 | greater than or equal |
+| 5 | greater than |
+
+### Hash strategy numbers
+
+Hash indexes require only one strategy:
+
+| Strategy | Meaning |
+|----------|---------|  
+| 1 | equal |
+
+### Support functions
+
+In addition to operator strategies, operator classes also specify support functions that the index method calls internally:
+
+| Index method | Support function number | Purpose |
+|-------------|------------------------|----------|
+| B-tree | 1 | Three-way comparison (returns negative/zero/positive) |
+| B-tree | 2 | (Optional) sorted-set support |
+| Hash | 1 | Compute hash value |
+| GiST | 1 | `consistent` — determine if key satisfies predicate |
+| GiST | 2 | `union` — compute union of key set |
+| GIN | 1 | `compare` |
+| GIN | 2 | `extractValue` |
+| GIN | 3 | `extractQuery` |
+| GIN | 4 | `consistent` |
+
+## Operator families
+
+An operator family groups together operator classes that have compatible semantics. This is important when comparing values of different-but-related types (cross-type operators).
+
+```sql
+CREATE OPERATOR FAMILY integer_ops USING btree;
+
+ALTER OPERATOR FAMILY integer_ops USING btree ADD
+    -- Operators
+    OPERATOR 1  < (int4, int4),
+    OPERATOR 2  <= (int4, int4),
+    OPERATOR 3  = (int4, int4),
+    -- ...
+    -- Support functions
+    FUNCTION 1  btint4cmp(int4, int4);
+```
+
+Operator families enable the planner to use indexes for cross-type comparisons, such as comparing an `int4` column with an `int8` constant.
+
+<Note>
+When you create an operator class with `CREATE OPERATOR CLASS`, a containing operator family is automatically created with the same name if one does not already exist.
+</Note>
+
+## Full example: complex number operators
+
+```sql
+-- Comparison function for B-tree ordering by absolute value
+CREATE FUNCTION complex_abs_cmp(complex, complex)
+    RETURNS integer AS $$
+    SELECT CASE
+        WHEN ($1.x^2 + $1.y^2) < ($2.x^2 + $2.y^2) THEN -1
+        WHEN ($1.x^2 + $1.y^2) > ($2.x^2 + $2.y^2) THEN  1
+        ELSE 0
+    END;
+$$ LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE FUNCTION complex_abs_lt(complex, complex) RETURNS boolean AS $$
+    SELECT ($1.x^2 + $1.y^2) < ($2.x^2 + $2.y^2);
+$$ LANGUAGE SQL IMMUTABLE STRICT;
+
+-- (define complex_abs_le, complex_abs_eq, complex_abs_ge, complex_abs_gt similarly)
+
+CREATE OPERATOR < (
+    leftarg = complex, rightarg = complex,
+    function = complex_abs_lt,
+    commutator = >, negator = >=,
+    restrict = scalarltsel, join = scalarltjoinsel
+);
+
+-- Create B-tree operator class
+CREATE OPERATOR CLASS complex_abs_ops
+    DEFAULT FOR TYPE complex USING btree AS
+        OPERATOR 1  <,
+        OPERATOR 2  <=,
+        OPERATOR 3  =,
+        OPERATOR 4  >=,
+        OPERATOR 5  >,
+        FUNCTION 1  complex_abs_cmp(complex, complex);
+
+-- Now you can index complex columns
+CREATE INDEX ON complex_table USING btree (val complex_abs_ops);
+SELECT * FROM complex_table ORDER BY val;  -- uses the operator class ordering
+```

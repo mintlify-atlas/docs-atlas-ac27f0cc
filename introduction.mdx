@@ -1,0 +1,104 @@
+---
+title: "Introduction to PostgreSQL"
+description: "PostgreSQL is an advanced object-relational database management system (ORDBMS) with over 35 years of active development. Learn what it is, where it came from, and when to use it."
+---
+
+PostgreSQL is an advanced object-relational database management system (ORDBMS) based on POSTGRES, Version 4.2, developed at the University of California at Berkeley Computer Science Department. POSTGRES pioneered many concepts that only became available in some commercial database systems much later.
+
+PostgreSQL is an open-source descendant of that original Berkeley code. It supports a large part of the SQL standard and offers many modern features — and because of its liberal license, PostgreSQL can be used, modified, and distributed by anyone free of charge for any purpose, be it private, commercial, or academic.
+
+## History
+
+The POSTGRES project began in 1986 under Professor Michael Stonebraker at UC Berkeley. The system was designed as a post-INGRES database, which is where its name originated. After the Berkeley project concluded, a group of developers took the source code and released it as **Postgres95** in 1995, adding a SQL interpreter and releasing it under an open-source license.
+
+In 1996 the project was renamed **PostgreSQL** to reflect its full support for SQL, and it has been developed by the global PostgreSQL Global Development Group ever since.
+
+<Info>
+  The PostgreSQL source carries copyright notices dating from 1996–2026 by the PostgreSQL Global Development Group, and from 1994 by the Regents of the University of California. This lineage is visible in every source file.
+</Info>
+
+## What PostgreSQL is
+
+In database terminology, PostgreSQL uses a **client/server model**. Each session consists of a server process — the `postgres` executable — that manages database files and accepts connections, and one or more client processes that send queries and receive results.
+
+The server can handle multiple concurrent connections. For each new connection the postmaster (the supervisor process) forks a new backend process. From that point on, the client and its dedicated backend communicate directly without involving the original supervisor process.
+
+<CardGroup cols={2}>
+  <Card title="Process architecture" icon="server" href="/concepts/architecture">
+    Learn how the postmaster, backend processes, bgwriter, autovacuum, and WAL writer interact.
+  </Card>
+  <Card title="MVCC" icon="layers" href="/concepts/mvcc">
+    Understand how PostgreSQL maintains data consistency without blocking readers.
+  </Card>
+</CardGroup>
+
+## Key features
+
+PostgreSQL supports an extended subset of the SQL standard, including:
+
+<CardGroup cols={2}>
+  <Card title="Complex queries" icon="magnifying-glass">
+    CTEs, subqueries, lateral joins, window functions, and a full expression system.
+  </Card>
+  <Card title="Foreign keys" icon="link">
+    Declarative referential integrity enforced at the storage engine level.
+  </Card>
+  <Card title="Triggers" icon="bolt">
+    Row- and statement-level triggers in any procedural language supported by the server.
+  </Card>
+  <Card title="Updatable views" icon="table">
+    Views that transparently support INSERT, UPDATE, and DELETE through automatic rule rewriting.
+  </Card>
+  <Card title="Transactional integrity" icon="shield-check">
+    Full ACID compliance — every statement executes inside a transaction, either explicit or implicit.
+  </Card>
+  <Card title="Multiversion concurrency control" icon="copy">
+    Readers never block writers, and writers never block readers. Implemented via per-tuple visibility fields rather than read locks.
+  </Card>
+</CardGroup>
+
+### Extensibility
+
+PostgreSQL can be extended at runtime without recompiling the server. Users can add:
+
+- **Data types** — define custom scalar, composite, array, range, and domain types
+- **Functions** — written in SQL, PL/pgSQL, PL/Python, PL/Perl, PL/Tcl, or C
+- **Operators** — bind custom functions to infix or prefix operator syntax
+- **Aggregate functions** — with custom transition and final functions
+- **Index methods** — plug in new access methods (B-tree, GiST, GIN, BRIN, and custom)
+- **Procedural languages** — add new server-side language handlers
+- **Foreign data wrappers** — connect to external data sources using the SQL/MED interface
+
+## When to use PostgreSQL
+
+PostgreSQL is a strong choice when you need:
+
+- **Strong data integrity** — foreign keys, check constraints, exclusion constraints, and serializable transactions prevent corrupt state
+- **Complex queries** — the planner handles multi-way joins, window functions, and recursive queries efficiently
+- **Extensible data model** — JSON/JSONB, arrays, hstore, geometric types, and custom types mean you rarely need a separate store
+- **Advanced concurrency** — MVCC and Serializable Snapshot Isolation let high-concurrency workloads proceed without excessive locking
+- **Reliability and durability** — Write-Ahead Logging (WAL) ensures crash recovery; streaming replication provides high availability
+- **Open-source licensing** — the PostgreSQL License is a permissive BSD-style license with no restrictions on commercial use
+
+<Warning>
+  PostgreSQL is a server process, not an embedded database. It requires a running server instance and a network or Unix-socket connection from clients. For embedded use cases (mobile apps, small tools), SQLite may be more appropriate.
+</Warning>
+
+## Documentation map
+
+This documentation is organized for different audiences:
+
+<AccordionGroup>
+  <Accordion title="New users">
+    Start with the [Quickstart](/quickstart) to install PostgreSQL, initialize a cluster, and run your first queries in minutes. Then read [Core Concepts](/concepts/architecture) to understand how the system works.
+  </Accordion>
+  <Accordion title="Application developers">
+    Read the SQL Reference section for data types, query syntax, transactions, and advanced features. The Developer Guide covers libpq, ECPG, and the procedural languages.
+  </Accordion>
+  <Accordion title="Database administrators">
+    The Administration section covers server setup, configuration, authentication, backup, replication, and routine maintenance.
+  </Accordion>
+  <Accordion title="Extension authors">
+    The Developer Guide's Extending PostgreSQL section covers custom functions, types, operators, foreign data wrappers, and table access methods.
+  </Accordion>
+</AccordionGroup>

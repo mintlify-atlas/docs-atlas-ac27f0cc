@@ -1,0 +1,255 @@
+---
+title: 'Partitioning'
+description: 'Declarative RANGE, LIST, and HASH partitioning in PostgreSQL. CREATE TABLE ... PARTITION OF, DEFAULT partition, partition pruning, partition-wise joins, and partition maintenance.'
+---
+
+Partitioning splits a large logical table into smaller physical pieces called partitions. PostgreSQL supports declarative partitioning: the database automatically routes rows to the correct partition and prunes irrelevant partitions from query plans.
+
+## Why partition?
+
+- **Query performance**: Partition pruning eliminates partitions that cannot contain relevant rows.
+- **Bulk operations**: Drop a whole month of data instantly with `DROP TABLE` or `DETACH PARTITION` instead of `DELETE`.
+- **Storage tiering**: Move older partitions to slower, cheaper tablespaces.
+- **Parallel scans**: Each partition can be scanned independently by parallel workers.
+
+Partitioning is typically worthwhile when a table exceeds the available physical memory of the database server.
+
+## Partitioning methods
+
+<CardGroup cols={3}>
+  <Card title="RANGE" icon="arrows-left-right">
+    Rows with partition key values within a contiguous range go to the same partition. Lower bound is inclusive; upper bound is exclusive.
+  </Card>
+  <Card title="LIST" icon="list">
+    Rows are assigned to a partition based on an explicit list of key values.
+  </Card>
+  <Card title="HASH" icon="hashtag">
+    Rows are distributed by the hash of the partition key modulo the number of partitions.
+  </Card>
+</CardGroup>
+
+## RANGE partitioning
+
+```sql
+CREATE TABLE measurement (
+    city_id   int  NOT NULL,
+    logdate   date NOT NULL,
+    peaktemp  int,
+    unitsales int
+) PARTITION BY RANGE (logdate);
+
+-- Create monthly partitions
+CREATE TABLE measurement_2024_01 PARTITION OF measurement
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE measurement_2024_02 PARTITION OF measurement
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+CREATE TABLE measurement_2024_03 PARTITION OF measurement
+    FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+
+-- Create an index on the partition key (propagated to all partitions)
+CREATE INDEX ON measurement (logdate);
+```
+
+<Note>
+Range upper bounds are exclusive. To cover all of January 2024, use `FROM ('2024-01-01') TO ('2024-02-01')`. Value `2024-02-01` belongs to the February partition, not January.
+</Note>
+
+### Multi-column range key
+
+```sql
+CREATE TABLE logs (
+    year    int,
+    quarter int,
+    data    text
+) PARTITION BY RANGE (year, quarter);
+
+CREATE TABLE logs_2024_q1 PARTITION OF logs
+    FOR VALUES FROM (2024, 1) TO (2024, 2);
+
+CREATE TABLE logs_2024_q2 PARTITION OF logs
+    FOR VALUES FROM (2024, 2) TO (2024, 3);
+```
+
+## LIST partitioning
+
+```sql
+CREATE TABLE orders (
+    order_id  bigint GENERATED ALWAYS AS IDENTITY,
+    region    text NOT NULL,
+    amount    numeric
+) PARTITION BY LIST (region);
+
+CREATE TABLE orders_us   PARTITION OF orders FOR VALUES IN ('us-east', 'us-west');
+CREATE TABLE orders_eu   PARTITION OF orders FOR VALUES IN ('eu-west', 'eu-central');
+CREATE TABLE orders_apac PARTITION OF orders FOR VALUES IN ('ap-south', 'ap-northeast');
+```
+
+## HASH partitioning
+
+```sql
+CREATE TABLE users (
+    user_id  bigint GENERATED ALWAYS AS IDENTITY,
+    username text NOT NULL,
+    email    text NOT NULL
+) PARTITION BY HASH (user_id);
+
+-- 4 partitions: modulus 4, remainders 0-3
+CREATE TABLE users_0 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE users_1 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE users_2 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE users_3 PARTITION OF users FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+```
+
+## DEFAULT partition
+
+A DEFAULT partition catches all rows that do not match any other partition. Only one DEFAULT partition is allowed per partitioned table.
+
+```sql
+CREATE TABLE events (
+    id      bigint GENERATED ALWAYS AS IDENTITY,
+    kind    text,
+    payload jsonb
+) PARTITION BY LIST (kind);
+
+CREATE TABLE events_click   PARTITION OF events FOR VALUES IN ('click');
+CREATE TABLE events_pageview PARTITION OF events FOR VALUES IN ('pageview');
+CREATE TABLE events_default  PARTITION OF events DEFAULT;
+```
+
+<Warning>
+When you add a new non-default partition, PostgreSQL must verify that no rows in the DEFAULT partition violate the new partition's bounds. This scans the DEFAULT partition. For large DEFAULT partitions, prefer pre-filtering inserts or create the new partition before data arrives.
+</Warning>
+
+## Sub-partitioning
+
+Partitions can themselves be partitioned:
+
+```sql
+CREATE TABLE logs (
+    region  text NOT NULL,
+    logdate date NOT NULL,
+    message text
+) PARTITION BY LIST (region);
+
+CREATE TABLE logs_us PARTITION OF logs
+    FOR VALUES IN ('us') PARTITION BY RANGE (logdate);
+
+CREATE TABLE logs_us_2024_01 PARTITION OF logs_us
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+```
+
+## Partition maintenance
+
+### Drop old data
+
+```sql
+-- Instant: drops all data in the partition
+DROP TABLE measurement_2024_01;
+```
+
+### Detach a partition
+
+```sql
+-- Detach so the data becomes an independent table (useful for archiving)
+ALTER TABLE measurement DETACH PARTITION measurement_2024_01;
+
+-- CONCURRENTLY avoids ACCESS EXCLUSIVE lock on the parent
+ALTER TABLE measurement DETACH PARTITION measurement_2024_01 CONCURRENTLY;
+```
+
+### Attach an existing table as a partition
+
+```sql
+-- Prepare a standalone table that matches the parent's schema
+CREATE TABLE measurement_2024_12
+    (LIKE measurement INCLUDING DEFAULTS INCLUDING CONSTRAINTS)
+    TABLESPACE cold_storage;
+
+-- Add a check constraint matching the partition bounds (avoids full scan on ATTACH)
+ALTER TABLE measurement_2024_12
+    ADD CONSTRAINT check_logdate
+    CHECK (logdate >= '2024-12-01' AND logdate < '2025-01-01');
+
+-- Load data, then attach
+ALTER TABLE measurement ATTACH PARTITION measurement_2024_12
+    FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
+
+-- Drop the now-redundant check constraint
+ALTER TABLE measurement_2024_12 DROP CONSTRAINT check_logdate;
+```
+
+## Partition pruning
+
+PostgreSQL automatically skips partitions whose bounds cannot contain rows matching the query's `WHERE` clause.
+
+```sql
+-- Only measurement_2024_01 will be scanned
+SELECT * FROM measurement WHERE logdate = '2024-01-15';
+
+-- Verify pruning with EXPLAIN
+EXPLAIN SELECT * FROM measurement WHERE logdate = '2024-01-15';
+```
+
+Ensure `enable_partition_pruning` is `on` (default):
+
+```sql
+SHOW enable_partition_pruning;  -- should be 'on'
+```
+
+## Partition-wise joins
+
+When two partitioned tables are joined on their partition keys with matching partition schemes, PostgreSQL can join each pair of matching partitions independently, which enables parallelism and avoids cross-partition hash builds.
+
+```sql
+SET enable_partitionwise_join = on;
+
+-- Both tables are partitioned by user_id with identical schemes
+SELECT u.username, COUNT(e.id)
+FROM users u
+JOIN events e ON u.user_id = e.user_id
+GROUP BY u.username;
+```
+
+## Unique constraints and foreign keys
+
+Unique constraints and primary keys on a partitioned table must include the partition key:
+
+```sql
+CREATE TABLE orders (
+    order_id  bigint,
+    tenant_id integer NOT NULL,
+    amount    numeric,
+    PRIMARY KEY (order_id, tenant_id)  -- tenant_id is the partition key
+) PARTITION BY HASH (tenant_id);
+```
+
+<Note>
+Foreign keys from non-partitioned tables to a partitioned table are supported. Foreign keys from a partitioned table to another table are also supported.
+</Note>
+
+## Automating partition creation with pg_partman
+
+pg_partman is a widely-used extension that automatically creates and maintains time-based or serial-based partitions.
+
+```sql
+-- Install (requires superuser)
+CREATE EXTENSION pg_partman SCHEMA partman;
+
+-- Set up automatic monthly partitioning for the measurement table
+SELECT partman.create_parent(
+    p_parent_table   => 'public.measurement',
+    p_control        => 'logdate',
+    p_interval       => '1 month',
+    p_premake        => 4  -- pre-create 4 future partitions
+);
+
+-- Run maintenance to create future partitions and drop expired ones
+-- (typically scheduled via pg_cron or a cron job)
+SELECT partman.run_maintenance();
+```
+
+<Tip>
+pg_partman is not included in the PostgreSQL core distribution. Install it via your package manager (e.g., `apt install postgresql-16-partman`) or from source.
+</Tip>

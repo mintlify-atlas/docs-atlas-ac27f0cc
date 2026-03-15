@@ -1,0 +1,389 @@
+---
+title: pgcrypto
+description: Cryptographic functions for PostgreSQL including hashing, password storage, PGP encryption, and random data generation.
+---
+
+The `pgcrypto` module provides cryptographic functions for PostgreSQL, including general-purpose hashing, HMAC, password storage, PGP symmetric and public-key encryption, raw cipher operations, and secure random data generation.
+
+<Note>
+`pgcrypto` requires OpenSSL. It will not be built or installed if PostgreSQL was compiled without OpenSSL support (`--with-ssl=openssl`).
+</Note>
+
+## Installation
+
+`pgcrypto` is a trusted extension and can be installed by any user with `CREATE` privilege:
+
+```sql
+CREATE EXTENSION pgcrypto;
+```
+
+## General hashing
+
+### digest()
+
+```sql
+digest(data text, type text) returns bytea
+digest(data bytea, type text) returns bytea
+```
+
+Computes a binary hash of `data` using the named algorithm. Supported algorithms: `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`. Any algorithm supported by your OpenSSL build is also available.
+
+```sql
+-- SHA-256 of a string
+SELECT digest('hello world', 'sha256');
+-- Returns bytea
+
+-- Hex-encoded SHA-256
+SELECT encode(digest('hello world', 'sha256'), 'hex');
+-- b94d27b9934d3e08a52e52d7da7dabfac484efe04294e576
+
+-- MD5
+SELECT encode(digest('hello world', 'md5'), 'hex');
+-- 5eb63bbbe01eeed093cb22bb8f5acdc3
+```
+
+<Warning>
+Do not use `md5` or `sha1` for security-sensitive purposes. These algorithms are cryptographically broken. Use `sha256` or higher for integrity verification, and `crypt()` for password hashing.
+</Warning>
+
+### hmac()
+
+```sql
+hmac(data text, key text, type text) returns bytea
+hmac(data bytea, key bytea, type text) returns bytea
+```
+
+Computes an HMAC (keyed hash) using `key`. The `type` argument is the same as for `digest()`. HMAC requires a secret key, making it impossible to reproduce the hash without the key.
+
+```sql
+SELECT encode(hmac('my message', 'secret_key', 'sha256'), 'hex');
+```
+
+---
+
+## Password hashing
+
+Use `crypt()` and `gen_salt()` for password storage. These are designed specifically for passwords and are deliberately slow to make brute-force attacks difficult.
+
+### gen_salt()
+
+```sql
+gen_salt(type text [, iter_count integer]) returns text
+```
+
+Generates a random salt string for use with `crypt()`. The `type` parameter specifies the hashing algorithm:
+
+| Algorithm | Adaptive | Max Password Length | Notes |
+|-----------|----------|--------------------|---------|
+| `bf` | Yes | 72 bytes | Blowfish-based (bcrypt), variant 2a. **Recommended.** |
+| `sha256crypt` | Yes | Unlimited | SHA-256 based. Modern and strong. |
+| `sha512crypt` | Yes | Unlimited | SHA-512 based. Modern and strong. |
+| `md5` | No | Unlimited | MD5-based crypt. Weak; avoid for new systems. |
+| `xdes` | Yes | 8 bytes | Extended DES. Very weak; do not use. |
+| `des` | No | 8 bytes | Original Unix crypt. Do not use. |
+
+The `iter_count` parameter controls the iteration count for adaptive algorithms (higher = slower = more secure against brute force):
+
+| Algorithm | Default | Min | Max |
+|-----------|---------|-----|-----|
+| `bf` | 6 | 4 | 31 |
+| `xdes` | 725 | 1 | 16777215 |
+| `sha256crypt`, `sha512crypt` | 5000 | 1000 | 999999999 |
+
+```sql
+-- Generate a bcrypt salt (cost factor 8)
+SELECT gen_salt('bf', 8);
+-- $2a$08$...
+
+-- Generate an sha512crypt salt with 100000 iterations
+SELECT gen_salt('sha512crypt', 100000);
+```
+
+### crypt()
+
+```sql
+crypt(password text, salt text) returns text
+```
+
+Hashes `password` using the algorithm encoded in `salt`. When storing a new password, pass a freshly generated salt. When verifying, pass the stored hash as the salt.
+
+```sql
+-- Store a new password (bcrypt, cost 8)
+INSERT INTO users (username, password_hash)
+VALUES ('alice', crypt('my_password', gen_salt('bf', 8)));
+
+-- Verify a password
+SELECT (password_hash = crypt('my_password', password_hash)) AS is_valid
+FROM users
+WHERE username = 'alice';
+
+-- Update a password
+UPDATE users
+SET password_hash = crypt('new_password', gen_salt('bf', 8))
+WHERE username = 'alice';
+```
+
+<Tip>
+For new applications, use bcrypt (`bf`) with a cost factor of 10 or higher. The cost doubles the hashing time for each increment. Cost 10 is a common production baseline as of 2024.
+</Tip>
+
+---
+
+## PGP symmetric encryption
+
+PGP (RFC 4880) symmetric encryption uses a passphrase to encrypt and decrypt data.
+
+### pgp_sym_encrypt() / pgp_sym_decrypt()
+
+```sql
+pgp_sym_encrypt(data text, psw text [, options text]) returns bytea
+pgp_sym_encrypt_bytea(data bytea, psw text [, options text]) returns bytea
+
+pgp_sym_decrypt(msg bytea, psw text [, options text]) returns text
+pgp_sym_decrypt_bytea(msg bytea, psw text [, options text]) returns bytea
+```
+
+```sql
+-- Encrypt a text value
+SELECT pgp_sym_encrypt('secret data', 'my_passphrase');
+
+-- Decrypt
+SELECT pgp_sym_decrypt(
+  pgp_sym_encrypt('secret data', 'my_passphrase'),
+  'my_passphrase'
+);
+-- secret data
+
+-- Store an encrypted column
+CREATE TABLE documents (
+  id      serial PRIMARY KEY,
+  title   text,
+  content bytea   -- stores PGP-encrypted data
+);
+
+INSERT INTO documents (title, content)
+VALUES (
+  'Confidential Report',
+  pgp_sym_encrypt('This is the secret content.', 'vault_passphrase')
+);
+
+-- Retrieve and decrypt
+SELECT title,
+  pgp_sym_decrypt(content, 'vault_passphrase') AS plaintext
+FROM documents
+WHERE id = 1;
+```
+
+### Encryption options
+
+Options are passed as a comma-separated `key=value` string:
+
+```sql
+SELECT pgp_sym_encrypt(
+  'secret data',
+  'my_passphrase',
+  'cipher-algo=aes256, compress-algo=1, compress-level=6'
+);
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cipher-algo` | `aes128` | Cipher: `aes128`, `aes192`, `aes256`, `bf`, `3des`, `cast5` |
+| `compress-algo` | `0` | Compression: `0` = none, `1` = ZIP, `2` = ZLIB |
+| `compress-level` | `6` | Compression level (0–9) |
+| `s2k-mode` | `3` | S2K algorithm: `0` = no salt, `1` = fixed iterations, `3` = variable iterations |
+| `s2k-digest-algo` | `sha1` | Digest for S2K: `md5`, `sha1` |
+| `s2k-cipher-algo` | same as `cipher-algo` | Cipher for session key encryption |
+| `unicode-mode` | `0` | Convert to/from UTF-8 during encryption |
+
+---
+
+## PGP public-key encryption
+
+Public-key encryption uses a key pair: anyone can encrypt with the public key, but only the holder of the secret key can decrypt.
+
+### pgp_pub_encrypt() / pgp_pub_decrypt()
+
+```sql
+pgp_pub_encrypt(data text, key bytea [, options text]) returns bytea
+pgp_pub_encrypt_bytea(data bytea, key bytea [, options text]) returns bytea
+
+pgp_pub_decrypt(msg bytea, key bytea [, psw text [, options text]]) returns text
+pgp_pub_decrypt_bytea(msg bytea, key bytea [, psw text [, options text]]) returns bytea
+```
+
+### Generating keys with GnuPG
+
+```bash
+# Generate a new key pair
+gpg --gen-key
+
+# List secret keys
+gpg --list-secret-keys
+
+# Export the public key (ASCII armor)
+gpg -a --export KEYID > public.key
+
+# Export the secret key (ASCII armor)
+gpg -a --export-secret-keys KEYID > secret.key
+```
+
+### Using public-key encryption
+
+```sql
+-- Load the keys into the database
+-- (store only what is needed; keep secret key secure)
+
+-- Encrypt with the public key
+SELECT pgp_pub_encrypt(
+  'secret data',
+  dearmor(pg_read_file('/path/to/public.key'))
+);
+
+-- Decrypt with the secret key
+SELECT pgp_pub_decrypt(
+  encrypted_column,
+  dearmor(pg_read_file('/path/to/secret.key'))
+)
+FROM secrets
+WHERE id = 1;
+
+-- If the secret key has a passphrase
+SELECT pgp_pub_decrypt(
+  encrypted_column,
+  dearmor(pg_read_file('/path/to/secret.key')),
+  'key_passphrase'
+)
+FROM secrets;
+```
+
+### Helper functions
+
+```sql
+-- Determine which key was used to encrypt a message
+SELECT pgp_key_id(encrypted_column) FROM secrets;
+-- Returns the key ID, 'SYMKEY' for symmetric, or 'ANYKEY' if key ID was removed
+
+-- Wrap binary data in ASCII armor (for storage as text or display)
+SELECT armor(pgp_sym_encrypt('data', 'pass'));
+
+-- Unwrap ASCII armor back to bytea
+SELECT dearmor(armor_text);
+
+-- Extract armor headers
+SELECT key, value FROM pgp_armor_headers(armor_text);
+```
+
+---
+
+## Raw encryption functions
+
+<Warning>
+Raw encryption functions do not provide integrity checking or IV management. They are provided for compatibility and low-level use cases. Prefer PGP functions for new applications.
+</Warning>
+
+```sql
+encrypt(data bytea, key bytea, type text) returns bytea
+decrypt(data bytea, key bytea, type text) returns bytea
+
+encrypt_iv(data bytea, key bytea, iv bytea, type text) returns bytea
+decrypt_iv(data bytea, key bytea, iv bytea, type text) returns bytea
+```
+
+The `type` string specifies the cipher algorithm and mode:
+
+```
+algorithm [-mode] [/pad:padding]
+```
+
+- **algorithm**: `aes` (AES-128/192/256, key length determines size) or `bf` (Blowfish)
+- **mode**: `cbc` (default), `cfb`, `ecb`
+- **padding**: `pkcs` (default), `none`
+
+```sql
+-- AES-CBC with PKCS padding (these are equivalent)
+SELECT encrypt('my data'::bytea, 'my_16_byte_key!!'::bytea, 'aes');
+SELECT encrypt('my data'::bytea, 'my_16_byte_key!!'::bytea, 'aes-cbc/pad:pkcs');
+
+-- Decrypt
+SELECT decrypt(
+  encrypt('my data'::bytea, 'my_16_byte_key!!'::bytea, 'aes'),
+  'my_16_byte_key!!'::bytea,
+  'aes'
+);
+```
+
+---
+
+## Random data
+
+### gen_random_bytes()
+
+```sql
+gen_random_bytes(count integer) returns bytea
+```
+
+Returns `count` cryptographically strong random bytes. Maximum 1024 bytes per call.
+
+```sql
+-- Generate 16 random bytes (128-bit key)
+SELECT encode(gen_random_bytes(16), 'hex');
+
+-- Generate a random token for session IDs or API keys
+SELECT encode(gen_random_bytes(32), 'base64');
+```
+
+### gen_random_uuid()
+
+```sql
+gen_random_uuid() returns uuid
+```
+
+Returns a version 4 (randomly generated) UUID. This function calls the same core PostgreSQL function of the same name and is available for compatibility.
+
+```sql
+SELECT gen_random_uuid();
+-- a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+```
+
+<Note>
+In PostgreSQL 13+, `gen_random_uuid()` is available as a built-in core function and does not require `pgcrypto`.
+</Note>
+
+---
+
+## Security considerations
+
+<Warning>
+All `pgcrypto` functions run inside the database server. Data and passwords travel between client applications and the server in plaintext unless you are using SSL. Always:
+
+1. Use SSL connections (`sslmode=require` or `sslmode=verify-full`).
+2. Trust both the system administrator and database administrator.
+
+If neither condition can be met, perform cryptographic operations in the client application instead.
+</Warning>
+
+- `pgcrypto` does not resist side-channel attacks. For example, decryption time may vary with ciphertext content.
+- When compiled against OpenSSL 3.0+, the legacy provider must be activated in `openssl.cnf` to use older ciphers like DES or Blowfish.
+- NULL arguments cause all functions to return NULL. Validate inputs before passing to cryptographic functions.
+
+## OpenSSL FIPS mode
+
+```sql
+-- Check if OpenSSL is running in FIPS mode
+SELECT fips_mode();
+-- t or f
+```
+
+The `pgcrypto.builtin_crypto_enabled` parameter controls availability of `gen_salt()` and `crypt()` under FIPS:
+
+| Value | Description |
+|-------|-------------|
+| `on` | Built-in crypto functions are enabled (default) |
+| `off` | Built-in crypto functions are disabled |
+| `fips` | Built-in crypto functions are disabled if OpenSSL is in FIPS mode |
+
+```ini
+# postgresql.conf
+pgcrypto.builtin_crypto_enabled = fips
+```
